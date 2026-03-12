@@ -1,0 +1,53 @@
+---
+# =============================================================================
+# STEP 6: Run datapatch on Primary
+# Works for: Data Guard AND Standalone
+# Variables from inventory: oracle_user, oracle_home, oracle_sid
+# =============================================================================
+- name: "STEP 6: Run datapatch on Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "DATAPATCH | Ensure PDBs are open"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER PLUGGABLE DATABASE ALL OPEN;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+
+    - name: "DATAPATCH | Run datapatch (takes ~5-10 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/OPatch/datapatch -verbose \
+          2>&1 | tee /tmp/datapatch.log
+      become_user: "{{ oracle_user }}"
+      register: datapatch_result
+
+    - name: "DATAPATCH | Show datapatch result (last 20 lines)"
+      debug:
+        msg: "{{ datapatch_result.stdout_lines[-20:] }}"
+
+    - name: "DATAPATCH | Verify datapatch status"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        COL patch_id FORMAT 99999999
+        COL action FORMAT A10
+        COL status FORMAT A10
+        COL description FORMAT A60
+        SELECT patch_id, action, status, description
+        FROM dba_registry_sqlpatch
+        ORDER BY action_time;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: sqlpatch
+      changed_when: false
+
+    - name: "DATAPATCH | Show sqlpatch status"
+      debug:
+        msg: "{{ sqlpatch.stdout_lines }}"

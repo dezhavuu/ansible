@@ -1,0 +1,218 @@
+---
+# =============================================================================
+# STEP 2: Patch Standby Server — Primary stays online
+# Works for: Data Guard only (skipped if no standby group)
+# Patches: GI → DB → OJVM (copy, apply, delete each to save disk space)
+# Variables from inventory: oracle_user, oracle_home, grid_home, oracle_sid,
+#   db_unique_name_pri, db_unique_name_stby, sys_password,
+#   patch_dir, patch_stage, gi_patch_zip, gi_patch_number,
+#   db_patch_zip, db_patch_number, ojvm_patch_zip, ojvm_patch_number
+# =============================================================================
+- name: "STEP 2: Patch Standby — Primary stays online"
+  hosts: standby
+  become: yes
+
+  tasks:
+    # =========================================================================
+    # STOP MRP + DB
+    # =========================================================================
+    - name: "STBY | Stop Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-OFF';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "STBY | Shutdown Standby Database"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SHUTDOWN IMMEDIATE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    # =========================================================================
+    # KILL REMAINING ORACLE PROCESSES (prevents opatchauto active files error)
+    # =========================================================================
+    - name: "STBY | Wait 10 seconds for processes to terminate"
+      pause:
+        seconds: 10
+
+    - name: "STBY | Kill remaining Oracle user processes"
+      shell: "pkill -9 -u {{ oracle_user }} || true"
+
+    - name: "STBY | Verify no Oracle DB processes running"
+      shell: "ps -ef | grep -E 'ora_|tnslsnr' | grep -v grep | grep -v asm || true"
+      register: remaining_procs
+      changed_when: false
+
+    - name: "STBY | Show remaining processes"
+      debug:
+        msg: "{{ remaining_procs.stdout_lines | default('none') }}"
+
+    # =========================================================================
+    # GI PATCH: copy → unzip → delete zip → apply → delete extracted
+    # =========================================================================
+    - name: "STBY-GI | Copy GI RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ gi_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "STBY-GI | Unzip GI RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ gi_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-GI | Delete GI ZIP to free space"
+      file:
+        path: "{{ patch_stage }}/{{ gi_patch_zip }}"
+        state: absent
+
+    - name: "STBY-GI | Apply GI RU via opatchauto (takes ~15-30 min)"
+      shell: |
+        export PATH={{ grid_home }}/OPatch:$PATH
+        {{ grid_home }}/OPatch/opatchauto apply {{ patch_stage }}/{{ gi_patch_number }} \
+          -oh {{ grid_home }} \
+          2>&1 | tee /tmp/gi_patch.log
+      register: gi_patch
+
+    - name: "STBY-GI | Show GI patching result (last 20 lines)"
+      debug:
+        msg: "{{ gi_patch.stdout_lines[-20:] }}"
+
+    - name: "STBY-GI | Delete extracted GI patch to free space"
+      file:
+        path: "{{ patch_stage }}/{{ gi_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # ENSURE DB STOPPED (opatchauto may have restarted it)
+    # =========================================================================
+    - name: "STBY | Ensure DB is stopped for DB RU patching"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl stop database -d {{ db_unique_name_stby }} -o immediate || true
+      register: db_stop
+      changed_when: "'already stopped' not in db_stop.stdout"
+
+    # =========================================================================
+    # DB PATCH: copy → unzip → delete zip → apply → delete extracted
+    # =========================================================================
+    - name: "STBY-DB | Copy DB RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ db_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "STBY-DB | Unzip DB RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ db_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-DB | Delete DB ZIP to free space"
+      file:
+        path: "{{ patch_stage }}/{{ db_patch_zip }}"
+        state: absent
+
+    - name: "STBY-DB | Apply DB RU via opatch (takes ~10-15 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/{{ db_patch_number }}
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/db_patch.log
+      become_user: "{{ oracle_user }}"
+      register: db_patch
+
+    - name: "STBY-DB | Show DB patching result (last 15 lines)"
+      debug:
+        msg: "{{ db_patch.stdout_lines[-15:] }}"
+
+    - name: "STBY-DB | Delete extracted DB patch"
+      file:
+        path: "{{ patch_stage }}/{{ db_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # OJVM PATCH: copy → unzip → delete zip → apply → delete extracted
+    # =========================================================================
+    - name: "STBY-OJVM | Copy OJVM RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ ojvm_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "STBY-OJVM | Unzip OJVM RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ ojvm_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-OJVM | Delete OJVM ZIP"
+      file:
+        path: "{{ patch_stage }}/{{ ojvm_patch_zip }}"
+        state: absent
+
+    - name: "STBY-OJVM | Apply OJVM RU via opatch"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/{{ ojvm_patch_number }}
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/ojvm_patch.log
+      become_user: "{{ oracle_user }}"
+      register: ojvm_patch
+
+    - name: "STBY-OJVM | Show OJVM patching result (last 15 lines)"
+      debug:
+        msg: "{{ ojvm_patch.stdout_lines[-15:] }}"
+
+    - name: "STBY-OJVM | Delete extracted OJVM patch"
+      file:
+        path: "{{ patch_stage }}/{{ ojvm_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # START STANDBY + MRP
+    # =========================================================================
+    - name: "STBY | Start Standby Database (MOUNT)"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_stby }} -o mount
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY | Enable Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-ON';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY | Wait for redo apply to catch up (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: stby_status
+      until: "'apply lag' in stby_status.stdout | lower and 'SUCCESS' in stby_status.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: "STBY | Verify patch level"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: stby_patches
+      changed_when: false
+
+    - name: "STBY | Show patches"
+      debug:
+        msg: "{{ stby_patches.stdout_lines }}"

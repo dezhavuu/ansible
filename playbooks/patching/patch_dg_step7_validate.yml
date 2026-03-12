@@ -1,0 +1,122 @@
+---
+# =============================================================================
+# STEP 7: Final validation + cleanup
+# Works for: Data Guard AND Standalone
+# Variables from inventory: oracle_user, oracle_home, oracle_sid,
+#   db_unique_name_pri, db_unique_name_stby, sys_password, patch_stage
+# =============================================================================
+
+# =========================================================================
+# PLAY 1: Version + Patches on all servers
+# =========================================================================
+- name: "STEP 7a: Validate versions and patches"
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "VALIDATE | Check Oracle version"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT banner_full FROM v\$version WHERE ROWNUM=1;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: db_version
+      changed_when: false
+
+    - name: "VALIDATE | Check GI patch level"
+      shell: "{{ grid_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: gi_patches
+      changed_when: false
+
+    - name: "VALIDATE | Check DB patch level"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: db_patches
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} ==="
+          - "Version: {{ db_version.stdout | trim }}"
+          - "GI Patches: {{ gi_patches.stdout_lines }}"
+          - "DB Patches: {{ db_patches.stdout_lines }}"
+
+# =========================================================================
+# PLAY 2: DG Broker validation (Data Guard only)
+# =========================================================================
+- name: "STEP 7b: Validate Data Guard Broker"
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "VALIDATE-DG | Check if standby group exists"
+      set_fact:
+        has_standby: "{{ groups['standby'] is defined and groups['standby'] | length > 0 }}"
+
+    - name: "VALIDATE-DG | Check DG Broker configuration"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: dg_config
+      changed_when: false
+      when: has_standby
+
+    - name: "VALIDATE-DG | Check transport and apply lag"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: dg_standby
+      changed_when: false
+      when: has_standby
+
+    - name: "VALIDATE-DG | Show DG results"
+      debug:
+        msg:
+          - "=== DG Broker Configuration ==="
+          - "{{ dg_config.stdout_lines }}"
+          - "=== Standby Database ==="
+          - "{{ dg_standby.stdout_lines }}"
+      when: has_standby
+
+    - name: "VALIDATE-DG | No Data Guard configured"
+      debug:
+        msg: "Standalone database — no Data Guard validation needed"
+      when: not has_standby
+
+# =========================================================================
+# PLAY 3: Cleanup
+# =========================================================================
+- name: "STEP 7c: Cleanup"
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "CLEANUP | Remove patch staging directory"
+      file:
+        path: "{{ patch_stage }}"
+        state: absent
+
+    - name: "CLEANUP | Remove patch log files"
+      shell: "rm -f /tmp/gi_patch*.log /tmp/db_patch*.log /tmp/ojvm_patch*.log /tmp/datapatch*.log"
+
+    - name: "CLEANUP | Show final disk space"
+      shell: "df -h /"
+      register: disk_space
+      changed_when: false
+
+    - name: "CLEANUP | Show disk space"
+      debug:
+        msg: "{{ disk_space.stdout }}"

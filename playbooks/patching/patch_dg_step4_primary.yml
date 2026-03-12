@@ -1,0 +1,241 @@
+---
+# =============================================================================
+# STEP 4: Patch Primary Server (or Standalone without Data Guard)
+# Works for: Data Guard (after switchover, 691 is now standby)
+#            AND Standalone (no Data Guard — just patch the server)
+# Patches: GI → DB → OJVM (copy, apply, delete each to save disk space)
+# Variables from inventory: oracle_user, oracle_home, grid_home, oracle_sid,
+#   db_unique_name_pri, db_unique_name_stby, sys_password,
+#   patch_dir, patch_stage, gi_patch_zip, gi_patch_number,
+#   db_patch_zip, db_patch_number, ojvm_patch_zip, ojvm_patch_number
+# =============================================================================
+
+# =========================================================================
+# PLAY 1: Stop DB + MRP (if Data Guard)
+# =========================================================================
+- name: "STEP 4a: Stop database on Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    # --- Data Guard: stop MRP via Broker ---
+    - name: "PRI | Stop Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-OFF';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+      when: groups['standby'] is defined and groups['standby'] | length > 0
+
+    # --- Shutdown DB ---
+    - name: "PRI | Shutdown Database"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SHUTDOWN IMMEDIATE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    # --- Kill remaining Oracle processes (prevents opatchauto active files error) ---
+    - name: "PRI | Wait 10 seconds for processes to terminate"
+      pause:
+        seconds: 10
+
+    - name: "PRI | Kill remaining Oracle user processes"
+      shell: "pkill -9 -u {{ oracle_user }} || true"
+
+    - name: "PRI | Verify no Oracle DB processes running"
+      shell: "ps -ef | grep -E 'ora_|tnslsnr' | grep -v grep | grep -v asm || true"
+      register: remaining_procs
+      changed_when: false
+
+    - name: "PRI | Show remaining processes"
+      debug:
+        msg: "{{ remaining_procs.stdout_lines | default('none') }}"
+
+# =========================================================================
+# PLAY 2: Apply patches
+# =========================================================================
+- name: "STEP 4b: Apply patches on Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    # =========================================================================
+    # GI PATCH
+    # =========================================================================
+    - name: "PRI-GI | Copy GI RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ gi_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "PRI-GI | Unzip GI RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ gi_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRI-GI | Delete GI ZIP to free space"
+      file:
+        path: "{{ patch_stage }}/{{ gi_patch_zip }}"
+        state: absent
+
+    - name: "PRI-GI | Apply GI RU via opatchauto (takes ~15-30 min)"
+      shell: |
+        export PATH={{ grid_home }}/OPatch:$PATH
+        {{ grid_home }}/OPatch/opatchauto apply {{ patch_stage }}/{{ gi_patch_number }} \
+          -oh {{ grid_home }} \
+          2>&1 | tee /tmp/gi_patch.log
+      register: gi_patch
+
+    - name: "PRI-GI | Show GI patching result (last 20 lines)"
+      debug:
+        msg: "{{ gi_patch.stdout_lines[-20:] }}"
+
+    - name: "PRI-GI | Delete extracted GI patch to free space"
+      file:
+        path: "{{ patch_stage }}/{{ gi_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # ENSURE DB STOPPED
+    # =========================================================================
+    - name: "PRI | Ensure DB is stopped for DB RU patching"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl stop database -d {{ db_unique_name_pri }} -o immediate || true
+      register: db_stop
+      changed_when: "'already stopped' not in db_stop.stdout"
+
+    # =========================================================================
+    # DB PATCH
+    # =========================================================================
+    - name: "PRI-DB | Copy DB RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ db_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "PRI-DB | Unzip DB RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ db_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRI-DB | Delete DB ZIP to free space"
+      file:
+        path: "{{ patch_stage }}/{{ db_patch_zip }}"
+        state: absent
+
+    - name: "PRI-DB | Apply DB RU via opatch (takes ~10-15 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/{{ db_patch_number }}
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/db_patch.log
+      become_user: "{{ oracle_user }}"
+      register: db_patch
+
+    - name: "PRI-DB | Show DB patching result (last 15 lines)"
+      debug:
+        msg: "{{ db_patch.stdout_lines[-15:] }}"
+
+    - name: "PRI-DB | Delete extracted DB patch"
+      file:
+        path: "{{ patch_stage }}/{{ db_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # OJVM PATCH
+    # =========================================================================
+    - name: "PRI-OJVM | Copy OJVM RU patch"
+      copy:
+        src: "{{ patch_dir }}/{{ ojvm_patch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    - name: "PRI-OJVM | Unzip OJVM RU patch"
+      shell: "cd {{ patch_stage }} && unzip -oq {{ ojvm_patch_zip }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRI-OJVM | Delete OJVM ZIP"
+      file:
+        path: "{{ patch_stage }}/{{ ojvm_patch_zip }}"
+        state: absent
+
+    - name: "PRI-OJVM | Apply OJVM RU via opatch"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/{{ ojvm_patch_number }}
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/ojvm_patch.log
+      become_user: "{{ oracle_user }}"
+      register: ojvm_patch
+
+    - name: "PRI-OJVM | Show OJVM patching result (last 15 lines)"
+      debug:
+        msg: "{{ ojvm_patch.stdout_lines[-15:] }}"
+
+    - name: "PRI-OJVM | Delete extracted OJVM patch"
+      file:
+        path: "{{ patch_stage }}/{{ ojvm_patch_number }}"
+        state: absent
+
+    # =========================================================================
+    # START DB
+    # =========================================================================
+    # --- Data Guard: start in MOUNT + enable MRP ---
+    - name: "PRI | Start Database (MOUNT — Data Guard standby)"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_pri }} -o mount
+      become_user: "{{ oracle_user }}"
+      when: groups['standby'] is defined and groups['standby'] | length > 0
+
+    - name: "PRI | Enable Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-ON';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      when: groups['standby'] is defined and groups['standby'] | length > 0
+
+    - name: "PRI | Wait for redo apply to catch up (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_pri }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: pri_status
+      until: "'apply lag' in pri_status.stdout | lower and 'SUCCESS' in pri_status.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+      when: groups['standby'] is defined and groups['standby'] | length > 0
+
+    # --- Standalone: start in OPEN ---
+    - name: "PRI | Start Database (OPEN — Standalone)"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_pri }}
+      become_user: "{{ oracle_user }}"
+      when: groups['standby'] is not defined or groups['standby'] | length == 0
+
+    - name: "PRI | Verify patch level"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: pri_patches
+      changed_when: false
+
+    - name: "PRI | Show patches"
+      debug:
+        msg: "{{ pri_patches.stdout_lines }}"

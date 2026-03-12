@@ -1,0 +1,565 @@
+---
+# =============================================================================
+# Oracle 19c — Data Guard Zero Downtime Patching to RU 19.27 (April 2025)
+# Order: Patch Standby → Switchover → Patch old Primary → Switchover back
+# DB is ALWAYS online — no downtime!
+# Variables from inventory: oracle_user, oracle_home, grid_home, oracle_sid,
+#   db_unique_name_pri, db_unique_name_stby, sys_password
+# =============================================================================
+
+# =========================================================================
+# PLAY 1: COPY PATCHES + UPDATE OPATCH (BOTH SERVERS)
+# =========================================================================
+- name: "STEP 1: Distribute patches and update OPatch"
+  hosts: oracle_servers
+  become: yes
+  vars:
+    patch_dir: /home/oracle/dbadmin/ansible/files/19c/patches
+    patch_stage: /tmp/patches_1927
+
+  tasks:
+    - name: "STAGE | Create patch staging directory"
+      file:
+        path: "{{ patch_stage }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0755'
+
+    - name: "STAGE | Check if patches already staged"
+      stat:
+        path: "{{ patch_stage }}/p37641958_190000_Linux-x86-64.zip"
+      register: patches_staged
+
+    - name: "STAGE | Copy GI RU patch"
+      copy:
+        src: "{{ patch_dir }}/p37641958_190000_Linux-x86-64.zip"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      when: not patches_staged.stat.exists
+
+    - name: "STAGE | Copy DB RU patch"
+      copy:
+        src: "{{ patch_dir }}/p37642901_190000_Linux-x86-64.zip"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      when: not patches_staged.stat.exists
+
+    - name: "STAGE | Copy OJVM RU patch"
+      copy:
+        src: "{{ patch_dir }}/p37499406_190000_Linux-x86-64.zip"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      when: not patches_staged.stat.exists
+
+    - name: "STAGE | Copy OPatch"
+      copy:
+        src: "{{ patch_dir }}/p6880880_190000_Linux-x86-64.zip"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      when: not patches_staged.stat.exists
+
+    - name: "STAGE | Unzip all patches"
+      shell: |
+        cd {{ patch_stage }}
+        unzip -oq p37641958_190000_Linux-x86-64.zip
+        unzip -oq p37642901_190000_Linux-x86-64.zip
+        unzip -oq p37499406_190000_Linux-x86-64.zip
+      become_user: "{{ oracle_user }}"
+      when: not patches_staged.stat.exists
+
+    - name: "OPATCH | Backup current OPatch in GRID_HOME"
+      shell: "mv {{ grid_home }}/OPatch {{ grid_home }}/OPatch.bak.$(date +%Y%m%d)"
+      args:
+        creates: "{{ grid_home }}/OPatch.bak.*"
+
+    - name: "OPATCH | Update OPatch in GRID_HOME"
+      shell: "unzip -oq {{ patch_stage }}/p6880880_190000_Linux-x86-64.zip -d {{ grid_home }} && chown -R oracle:oinstall {{ grid_home }}/OPatch"
+
+    - name: "OPATCH | Backup current OPatch in ORACLE_HOME"
+      shell: "mv {{ oracle_home }}/OPatch {{ oracle_home }}/OPatch.bak.$(date +%Y%m%d)"
+      become_user: "{{ oracle_user }}"
+      args:
+        creates: "{{ oracle_home }}/OPatch.bak.*"
+
+    - name: "OPATCH | Update OPatch in ORACLE_HOME"
+      shell: "unzip -oq {{ patch_stage }}/p6880880_190000_Linux-x86-64.zip -d {{ oracle_home }}"
+      become_user: "{{ oracle_user }}"
+
+    - name: "OPATCH | Verify OPatch version in ORACLE_HOME"
+      shell: "{{ oracle_home }}/OPatch/opatch version"
+      become_user: "{{ oracle_user }}"
+      register: opatch_ver
+      changed_when: false
+
+    - name: "OPATCH | Show version"
+      debug:
+        msg: "{{ opatch_ver.stdout }}"
+
+# =========================================================================
+# PLAY 2: PATCH STANDBY (PRIMARY STAYS ONLINE)
+# =========================================================================
+- name: "STEP 2: Patch Standby — Primary stays online"
+  hosts: standby
+  become: yes
+  vars:
+    patch_stage: /tmp/patches_1927
+
+  tasks:
+    - name: "STBY-STOP | Stop Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-OFF';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "STBY-STOP | Shutdown Standby Database"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SHUTDOWN IMMEDIATE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "STBY-GI | Apply GI RU 19.27 via opatchauto (takes ~15-30 min)"
+      shell: |
+        export PATH={{ grid_home }}/OPatch:$PATH
+        {{ grid_home }}/OPatch/opatchauto apply {{ patch_stage }}/37641958 \
+          -oh {{ grid_home }} \
+          2>&1 | tee /tmp/gi_patch_1927.log
+      register: gi_patch
+      ignore_errors: yes
+
+    - name: "STBY-GI | Show GI patching result (last 20 lines)"
+      debug:
+        msg: "{{ gi_patch.stdout_lines[-20:] }}"
+
+    - name: "STBY-DBSTOP | Ensure DB is stopped for DB RU patching"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl stop database -d {{ db_unique_name_stby }} -o immediate
+      ignore_errors: yes
+
+    - name: "STBY-DB | Apply DB RU 19.27 via opatch (takes ~10-15 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/37642901
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/db_patch_1927.log
+      become_user: "{{ oracle_user }}"
+      register: db_patch
+
+    - name: "STBY-DB | Show DB patching result (last 15 lines)"
+      debug:
+        msg: "{{ db_patch.stdout_lines[-15:] }}"
+
+    - name: "STBY-OJVM | Apply OJVM RU 19.27 via opatch"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/37499406
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/ojvm_patch_1927.log
+      become_user: "{{ oracle_user }}"
+      register: ojvm_patch
+
+    - name: "STBY-OJVM | Show OJVM patching result (last 15 lines)"
+      debug:
+        msg: "{{ ojvm_patch.stdout_lines[-15:] }}"
+
+    - name: "STBY-START | Start Standby Database (MOUNT)"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_stby }} -o mount
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-START | Enable Managed Recovery via DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-ON';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-VERIFY | Wait for redo apply to catch up (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: stby_status
+      until: "'apply lag' in stby_status.stdout | lower and 'SUCCESS' in stby_status.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: "STBY-VERIFY | Verify standby patch level"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: stby_patches
+      changed_when: false
+
+    - name: "STBY-VERIFY | Show standby patches"
+      debug:
+        msg: "{{ stby_patches.stdout_lines }}"
+
+# =========================================================================
+# PLAY 3: SWITCHOVER — STANDBY BECOMES PRIMARY
+# =========================================================================
+- name: "STEP 3: Switchover — dghost-002 becomes Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "SWITCHOVER | Verify DG config before switchover"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: pre_switchover
+      changed_when: false
+
+    - name: "SWITCHOVER | Show pre-switchover status"
+      debug:
+        msg: "{{ pre_switchover.stdout_lines }}"
+
+    - name: "SWITCHOVER | Execute switchover to standby (takes ~1-3 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SWITCHOVER TO '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchover_result
+
+    - name: "SWITCHOVER | Show switchover result"
+      debug:
+        msg: "{{ switchover_result.stdout_lines }}"
+
+    - name: "SWITCHOVER | Wait for switchover to complete (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchover_check
+      until: "'SUCCESS' in switchover_check.stdout and db_unique_name_stby + ' - Primary' in switchover_check.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: "SWITCHOVER | Verify new configuration"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: post_switchover
+      changed_when: false
+
+    - name: "SWITCHOVER | Show post-switchover status"
+      debug:
+        msg: "{{ post_switchover.stdout_lines }}"
+
+# =========================================================================
+# PLAY 4: PATCH OLD PRIMARY (NOW STANDBY) — NEW PRIMARY STAYS ONLINE
+# =========================================================================
+- name: "STEP 4: Patch dghost-001 (now Standby) — dghost-002 (new Primary) stays online"
+  hosts: primary
+  become: yes
+  vars:
+    patch_stage: /tmp/patches_1927
+
+  tasks:
+    - name: "PRI-STOP | Stop Managed Recovery on old primary (now standby)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-OFF';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "PRI-STOP | Shutdown Database on dghost-001"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SHUTDOWN IMMEDIATE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "PRI-GI | Apply GI RU 19.27 via opatchauto (takes ~15-30 min)"
+      shell: |
+        export PATH={{ grid_home }}/OPatch:$PATH
+        {{ grid_home }}/OPatch/opatchauto apply {{ patch_stage }}/37641958 \
+          -oh {{ grid_home }} \
+          2>&1 | tee /tmp/gi_patch_1927.log
+      register: gi_patch
+      ignore_errors: yes
+
+    - name: "PRI-GI | Show GI patching result (last 20 lines)"
+      debug:
+        msg: "{{ gi_patch.stdout_lines[-20:] }}"
+
+    - name: "PRI-DBSTOP | Ensure DB is stopped for DB RU patching"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl stop database -d {{ db_unique_name_pri }} -o immediate
+      ignore_errors: yes
+
+    - name: "PRI-DB | Apply DB RU 19.27 via opatch (takes ~10-15 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/37642901
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/db_patch_1927.log
+      become_user: "{{ oracle_user }}"
+      register: db_patch
+
+    - name: "PRI-DB | Show DB patching result (last 15 lines)"
+      debug:
+        msg: "{{ db_patch.stdout_lines[-15:] }}"
+
+    - name: "PRI-OJVM | Apply OJVM RU 19.27 via opatch"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        cd {{ patch_stage }}/37499406
+        {{ oracle_home }}/OPatch/opatch apply -silent -force \
+          2>&1 | tee /tmp/ojvm_patch_1927.log
+      become_user: "{{ oracle_user }}"
+      register: ojvm_patch
+
+    - name: "PRI-OJVM | Show OJVM patching result (last 15 lines)"
+      debug:
+        msg: "{{ ojvm_patch.stdout_lines[-15:] }}"
+
+    - name: "PRI-START | Start Database on dghost-001 (MOUNT — it's now standby)"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_pri }} -o mount
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRI-START | Enable Managed Recovery"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-ON';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRI-VERIFY | Wait for redo apply to catch up (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_pri }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: pri_status
+      until: "'apply lag' in pri_status.stdout | lower and 'SUCCESS' in pri_status.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: "PRI-VERIFY | Verify patch level"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: pri_patches
+      changed_when: false
+
+    - name: "PRI-VERIFY | Show patches"
+      debug:
+        msg: "{{ pri_patches.stdout_lines }}"
+
+# =========================================================================
+# PLAY 5: SWITCHOVER BACK — RESTORE ORIGINAL ROLES
+# =========================================================================
+- name: "STEP 5: Switchover back — dghost-001 becomes Primary again"
+  hosts: standby
+  become: yes
+
+  tasks:
+    - name: "SWITCHBACK | Verify DG config before switchback"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: pre_switchback
+      changed_when: false
+
+    - name: "SWITCHBACK | Show pre-switchback status"
+      debug:
+        msg: "{{ pre_switchback.stdout_lines }}"
+
+    - name: "SWITCHBACK | Execute switchover back to original primary"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SWITCHOVER TO '{{ db_unique_name_pri }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchback_result
+
+    - name: "SWITCHBACK | Show switchback result"
+      debug:
+        msg: "{{ switchback_result.stdout_lines }}"
+
+    - name: "SWITCHBACK | Wait for switchback to complete (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchback_check
+      until: "'SUCCESS' in switchback_check.stdout and db_unique_name_pri + ' - Primary' in switchback_check.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+# =========================================================================
+# PLAY 6: DATAPATCH ON PRIMARY
+# =========================================================================
+- name: "STEP 6: Run datapatch on Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "DATAPATCH | Ensure PDBs are open"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER PLUGGABLE DATABASE ALL OPEN;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+
+    - name: "DATAPATCH | Run datapatch (takes ~5-10 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/OPatch/datapatch -verbose \
+          2>&1 | tee /tmp/datapatch_1927.log
+      become_user: "{{ oracle_user }}"
+      register: datapatch_result
+
+    - name: "DATAPATCH | Show datapatch result (last 20 lines)"
+      debug:
+        msg: "{{ datapatch_result.stdout_lines[-20:] }}"
+
+# =========================================================================
+# PLAY 7: FINAL VALIDATION
+# =========================================================================
+- name: "STEP 7: Final validation"
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "VALIDATE | Check Oracle version"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT banner_full FROM v\$version WHERE ROWNUM=1;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: db_version
+      changed_when: false
+
+    - name: "VALIDATE | Check applied patches"
+      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+      become_user: "{{ oracle_user }}"
+      register: patches
+      changed_when: false
+
+    - name: "VALIDATE | Show version and patches"
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} ==="
+          - "{{ db_version.stdout | trim }}"
+          - "{{ patches.stdout_lines }}"
+
+- name: "Final DG Broker and datapatch validation"
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "VALIDATE | Check DG Broker"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: dg_final
+      changed_when: false
+
+    - name: "VALIDATE | Check datapatch status"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        COL patch_id FORMAT 99999999
+        COL action FORMAT A10
+        COL status FORMAT A10
+        COL description FORMAT A60
+        SELECT patch_id, action, status, description
+        FROM dba_registry_sqlpatch
+        ORDER BY action_time;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: sqlpatch
+      changed_when: false
+
+    - name: "VALIDATE | Show final results"
+      debug:
+        msg:
+          - "=== DG Broker ==="
+          - "{{ dg_final.stdout_lines }}"
+          - "=== Datapatch Status ==="
+          - "{{ sqlpatch.stdout_lines }}"
+
+# =========================================================================
+# PLAY 8: CLEANUP
+# =========================================================================
+- name: "Cleanup patch staging"
+  hosts: oracle_servers
+  become: yes
+  vars:
+    patch_stage: /tmp/patches_1927
+
+  tasks:
+    - name: "CLEANUP | Remove patch staging directory"
+      file:
+        path: "{{ patch_stage }}"
+        state: absent

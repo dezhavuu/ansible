@@ -1,0 +1,248 @@
+---
+#  =============================================================================
+# Oracle 19c  Grid Infrastructure Installation (Standalone, ASM)
+# Variables from group_vars/all.yml: oracle_user
+# Variables from inventory: oracle_base, oracle_home, grid_home, oracle_inventory
+# =============================================================================
+- name: Oracle 19c Grid Infrastructure Installation
+  hosts: oracle_servers
+  become: yes
+  vars:
+    grid_zip: /home/oracle/dbadmin/ansible/files/19c/LINUX.X64_193000_grid_home.zip
+    asm_sys_password: {{ vault_sys_password }}
+    asm_discovery_string: "/dev/sdb1,/dev/sdc1"
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: COPY GRID ZIP TO SERVERS
+    # =========================================================================
+    - name: "COPY | Check if Grid ZIP already exists on target"
+      stat:
+        path: /tmp/LINUX.X64_193000_grid_home.zip
+      register: grid_zip_exists
+
+    - name: "COPY | Copy Grid Infrastructure ZIP to target (takes ~5-10 min)"
+      copy:
+        src: "{{ grid_zip }}"
+        dest: /tmp/LINUX.X64_193000_grid_home.zip
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0644'
+      when: not grid_zip_exists.stat.exists
+
+    # =========================================================================
+    # PHASE 2: UNZIP INTO GRID_HOME
+    # =========================================================================
+    - name: "UNZIP | Check if already unzipped"
+      stat:
+        path: "{{ grid_home }}/gridSetup.sh"
+      register: grid_setup_exists
+
+    - name: "UNZIP | Unzip Grid Infrastructure into GRID_HOME"
+      shell: |
+        cd {{ grid_home }}
+        unzip -oq /tmp/LINUX.X64_193000_grid_home.zip
+      become_user: "{{ oracle_user }}"
+      when: not grid_setup_exists.stat.exists
+
+    # =========================================================================
+    # PHASE 3: CREATE RESPONSE FILE
+    # =========================================================================
+    - name: "RESPONSE | Create GI silent install response file"
+      copy:
+        dest: /tmp/grid_install.rsp
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0600'
+        content: |
+          oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+          INVENTORY_LOCATION={{ oracle_inventory }}
+          oracle.install.option=HA_CONFIG
+          ORACLE_BASE={{ oracle_base }}
+          oracle.install.asm.OSDBA=asmdba
+          oracle.install.asm.OSOPER=asmoper
+          oracle.install.asm.OSASM=asmadmin
+          oracle.install.asm.storageOption=ASM
+          oracle.install.asm.SYSASMPassword={{ asm_sys_password }}
+          oracle.install.asm.monitorPassword={{ asm_sys_password }}
+          oracle.install.asm.diskGroup.name=DATA
+          oracle.install.asm.diskGroup.redundancy=EXTERNAL
+          oracle.install.asm.diskGroup.AUSize=4
+          oracle.install.asm.diskGroup.disks=/dev/sdb1
+          oracle.install.asm.diskGroup.diskDiscoveryString={{ asm_discovery_string }}
+          oracle.install.asm.configureAFD=false
+          oracle.install.crs.config.ClusterConfiguration=STANDALONE
+          oracle.install.crs.rootconfig.executeRootScript=false
+
+    # =========================================================================
+    # PHASE 4: RUN GRID INFRASTRUCTURE INSTALLER
+    # =========================================================================
+    - name: "INSTALL | Check if orainstRoot.sh was already executed"
+      stat:
+        path: "{{ oracle_inventory }}/ContentsXML/inventory.xml"
+      register: orainst_done
+
+    - name: "INSTALL | Run Grid Infrastructure installer (takes ~10-20 min)"
+      shell: |
+        export CV_ASSUME_DISTID=OL8
+        {{ grid_home }}/gridSetup.sh -silent \
+          -responseFile /tmp/grid_install.rsp \
+          -waitforcompletion \
+          ORACLE_HOME={{ grid_home }} \
+          2>&1 | tee /tmp/grid_install.log
+        exit 0
+      become_user: "{{ oracle_user }}"
+      environment:
+        CV_ASSUME_DISTID: OL8
+      register: grid_install
+      when: not orainst_done.stat.exists
+
+    - name: "INSTALL | Show installer output"
+      debug:
+        msg: "{{ grid_install.stdout_lines }}"
+      when: grid_install.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 5: RUN ROOT SCRIPTS
+    # =========================================================================
+    - name: "ROOT | Check if root.sh was already executed"
+      stat:
+        path: /etc/oracle
+      register: root_sh_done
+
+    - name: "ROOT | Check if orainstRoot.sh exists"
+      stat:
+        path: "{{ oracle_inventory }}/orainstRoot.sh"
+      register: orainst_script
+
+    - name: "ROOT | Run orainstRoot.sh"
+      shell: "{{ oracle_inventory }}/orainstRoot.sh"
+      when: not root_sh_done.stat.exists and orainst_script.stat.exists
+
+    - name: "ROOT | Run root.sh (takes ~2-5 min)"
+      shell: "{{ grid_home }}/root.sh 2>&1 | tee /tmp/root_sh.log"
+      register: root_sh
+      when: not root_sh_done.stat.exists
+
+    - name: "ROOT | Show root.sh output"
+      debug:
+        msg: "{{ root_sh.stdout_lines }}"
+      when: root_sh.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 6: CONFIGURE ASM + CREATE DISKGROUPS
+    # =========================================================================
+    - name: "ASM | Check if ASM instance is running"
+      shell: "ps -ef | grep asm_pmon | grep -v grep || true"
+      register: asm_running
+      changed_when: false
+
+    - name: "ASM | Create ASM instance + DATA diskgroup via ASMCA"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_BASE={{ oracle_base }}
+        {{ grid_home }}/bin/asmca -silent \
+          -configureASM \
+          -sysAsmPassword {{ asm_sys_password }} \
+          -asmsnmpPassword {{ asm_sys_password }} \
+          -diskGroupName DATA \
+          -diskList /dev/sdb1 \
+          -redundancy EXTERNAL \
+          -au_size 4 \
+          2>&1 | tee /tmp/asmca_data.log
+      become_user: "{{ oracle_user }}"
+      register: asmca_data
+      when: "'asm_pmon' not in asm_running.stdout"
+
+    - name: "ASM | Show ASMCA DATA result"
+      debug:
+        msg: "{{ asmca_data.stdout_lines }}"
+      when: asmca_data.stdout_lines is defined
+
+    - name: "FRA | Check if FRA diskgroup exists"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM
+        {{ grid_home }}/bin/asmcmd lsdg | grep FRA || true
+      become_user: "{{ oracle_user }}"
+      register: fra_check
+      changed_when: false
+
+    - name: "FRA | Create FRA diskgroup"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM
+        {{ grid_home }}/bin/asmca -silent \
+          -createDiskGroup \
+          -diskGroupName FRA \
+          -diskList /dev/sdc1 \
+          -redundancy EXTERNAL \
+          -au_size 4 \
+          2>&1 | tee /tmp/asmca_fra.log
+      become_user: "{{ oracle_user }}"
+      register: fra_create
+      when: "'FRA' not in fra_check.stdout"
+
+    - name: "FRA | Show FRA creation result"
+      debug:
+        msg: "{{ fra_create.stdout_lines }}"
+      when: fra_create.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 7: CONFIGURE LISTENER VIA NETCA
+    # =========================================================================
+    - name: "LISTENER | Check if listener is running"
+      shell: "{{ grid_home }}/bin/lsnrctl status || true"
+      become_user: "{{ oracle_user }}"
+      environment:
+        ORACLE_HOME: "{{ grid_home }}"
+      register: listener_check
+      changed_when: false
+
+    - name: "LISTENER | Configure listener via NETCA"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/netca -silent \
+          -responsefile {{ grid_home }}/network/install/netca_typ.rsp \
+          2>&1 | tee /tmp/netca.log
+      become_user: "{{ oracle_user }}"
+      when: "'no listener' in listener_check.stdout"
+
+    # =========================================================================
+    # PHASE 8: VALIDATION
+    # =========================================================================
+    - name: "VALIDATE | Check CRS status"
+      shell: "{{ grid_home }}/bin/crsctl stat res -t"
+      become_user: "{{ oracle_user }}"
+      environment:
+        ORACLE_HOME: "{{ grid_home }}"
+      register: crs_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "VALIDATE | Check ASM diskgroups"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM
+        {{ grid_home }}/bin/asmcmd lsdg
+      become_user: "{{ oracle_user }}"
+      register: asm_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "=== CRS Status ==="
+          - "{{ crs_status.stdout_lines | default('not available') }}"
+          - "=== ASM Diskgroups ==="
+          - "{{ asm_status.stdout_lines | default('not available') }}"
+
+    # =========================================================================
+    # PHASE 9: CLEANUP
+    # =========================================================================
+    - name: "CLEANUP | Remove Grid ZIP from /tmp"
+      file:
+        path: /tmp/LINUX.X64_193000_grid_home.zip
+        state: absent
+

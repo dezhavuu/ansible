@@ -1,0 +1,141 @@
+---
+# =============================================================================
+# Oracle 19c  Grid Infrastructure Deinstall / Complete Reset
+# WARNING: This playbook DESTROYS all ASM diskgroups and GI configuration!
+# Variables from group_vars/all.yml: oracle_user
+# Variables from inventory: oracle_base, grid_home, oracle_inventory
+# =============================================================================
+- name: Oracle 19c Grid Infrastructure Deinstall
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: DROP ASM DISKGROUPS
+    # =========================================================================
+    - name: "ASM | Check if ASM instance is running"
+      shell: "ps -ef | grep asm_pmon | grep -v grep || true"
+      register: asm_running
+      changed_when: false
+
+    - name: "ASM | Drop FRA diskgroup"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM
+        {{ grid_home }}/bin/sqlplus -s / as sysasm <<EOF
+        DROP DISKGROUP FRA INCLUDING CONTENTS;
+        EOF
+      become_user: "{{ oracle_user }}"
+      when: "'asm_pmon' in asm_running.stdout"
+      ignore_errors: yes
+
+    - name: "ASM | Dismount and drop DATA diskgroup"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM
+        {{ grid_home }}/bin/sqlplus -s / as sysasm <<EOF
+        ALTER DISKGROUP DATA DISMOUNT FORCE;
+        DROP DISKGROUP DATA FORCE INCLUDING CONTENTS;
+        EOF
+      become_user: "{{ oracle_user }}"
+      when: "'asm_pmon' in asm_running.stdout"
+      ignore_errors: yes
+
+    # =========================================================================
+    # PHASE 2: STOP CRS
+    # =========================================================================
+    - name: "CRS | Check if CRS is running"
+      shell: "{{ grid_home }}/bin/crsctl check has || true"
+      register: crs_running
+      changed_when: false
+
+    - name: "CRS | Stop Oracle High Availability Services"
+      shell: "{{ grid_home }}/bin/crsctl stop has -f"
+      when: "'ONLINE' in crs_running.stdout"
+      ignore_errors: yes
+
+    # =========================================================================
+    # PHASE 3: DECONFIG GI
+    # =========================================================================
+    - name: "DECONFIG | Check if roothas.sh exists"
+      stat:
+        path: "{{ grid_home }}/crs/install/roothas.sh"
+      register: roothas_exists
+
+    - name: "DECONFIG | Deconfigure Oracle Restart"
+      shell: "{{ grid_home }}/crs/install/roothas.sh -deconfig -force 2>&1 | tee /tmp/deconfig.log"
+      when: roothas_exists.stat.exists
+      ignore_errors: yes
+
+    # =========================================================================
+    # PHASE 4: REMOVE INVENTORY
+    # =========================================================================
+    - name: "INVENTORY | Check if orainstRoot.sh exists"
+      stat:
+        path: "{{ oracle_inventory }}/orainstRoot.sh"
+      register: orainst_exists
+
+    - name: "INVENTORY | Remove Oracle Inventory"
+      shell: "{{ oracle_inventory }}/orainstRoot.sh -uninst"
+      when: orainst_exists.stat.exists
+      ignore_errors: yes
+
+    # =========================================================================
+    # PHASE 5: CLEANUP FILES AND DIRECTORIES
+    # =========================================================================
+    - name: "CLEANUP | Remove Grid Home contents"
+      shell: "rm -rf {{ grid_home }}/*"
+
+    - name: "CLEANUP | Fix Grid Home ownership after cleanup"
+      file:
+        path: "{{ grid_home }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0775'
+
+    - name: "CLEANUP | Remove Oracle Inventory contents"
+      shell: "rm -rf {{ oracle_inventory }}/*"
+
+    - name: "CLEANUP | Fix Oracle Inventory ownership after cleanup"
+      file:
+        path: "{{ oracle_inventory }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0775'
+
+    - name: "CLEANUP | Remove CRS data and config files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ oracle_base }}/cfgtoollogs"
+        - "{{ oracle_base }}/crsdata"
+        - /etc/oracle
+        - /etc/oratab
+
+    - name: "CLEANUP | Remove temp and log files"
+      shell: "rm -f /tmp/grid_install* /tmp/root_sh.log /tmp/asmca*.log /tmp/netca.log /tmp/configtools.log /tmp/deconfig.log"
+
+    - name: "CLEANUP | Remove GridSetupActions temp dirs"
+      shell: "rm -rf /tmp/GridSetupActions*"
+
+    # =========================================================================
+    # PHASE 6: VALIDATION
+    # =========================================================================
+    - name: "VALIDATE | Check Grid Home is empty"
+      shell: "ls {{ grid_home }}/ | wc -l"
+      register: grid_files
+      changed_when: false
+
+    - name: "VALIDATE | Check no Oracle processes running"
+      shell: "ps -ef | grep -E 'asm_|ora_|tnslsnr' | grep -v grep | wc -l"
+      register: ora_procs
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "Grid Home files: {{ grid_files.stdout }} (expected: 0)"
+          - "Oracle processes: {{ ora_procs.stdout }} (expected: 0)"
+          - "{{ 'CLEAN  ready for reinstall' if (grid_files.stdout | trim == '0' and ora_procs.stdout | trim == '0') else 'WARNING  cleanup incomplete!' }}"
+

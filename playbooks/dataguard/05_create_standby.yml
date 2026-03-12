@@ -1,0 +1,256 @@
+---
+# =============================================================================
+# Oracle 19c  Create Physical Standby Database via RMAN Duplicate
+# Variables from group_vars/all.yml: oracle_user
+# Variables from inventory: oracle_base, oracle_home, grid_home,
+#   oracle_sid, db_unique_name_pri/stby, sys_password
+# =============================================================================
+
+# =========================================================================
+# PLAY 1: PREPARE STANDBY SERVER
+# =========================================================================
+- name: Prepare standby server for RMAN duplicate
+  hosts: standby
+  become: yes
+
+  tasks:
+    - name: "PREP | Check if standby database already running"
+      shell: "ps -ef | grep pmon_{{ oracle_sid }} | grep -v grep || true"
+      register: stby_running
+      changed_when: false
+
+    - name: "PREP | Create adump directory"
+      file:
+        path: "{{ oracle_base }}/admin/{{ db_unique_name_stby }}/adump"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0755'
+
+    - name: "PREP | Create init file for standby NOMOUNT"
+      copy:
+        dest: "{{ oracle_home }}/dbs/init{{ oracle_sid }}.ora"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0640'
+        content: |
+          db_name=CDBTEST
+          db_unique_name={{ db_unique_name_stby }}
+          db_create_file_dest=+DATA
+          db_recovery_file_dest=+FRA
+          db_recovery_file_dest_size=98G
+          sga_target=4G
+          pga_aggregate_target=1G
+          remote_login_passwordfile=EXCLUSIVE
+          fal_server={{ db_unique_name_pri }}
+          log_archive_config='DG_CONFIG=({{ db_unique_name_pri }},{{ db_unique_name_stby }})'
+          log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME={{ db_unique_name_stby }}'
+          standby_file_management=AUTO
+          audit_file_dest={{ oracle_base }}/admin/{{ db_unique_name_stby }}/adump
+      when: "'pmon_' + oracle_sid not in stby_running.stdout"
+
+    - name: "PREP | Start standby instance in NOMOUNT"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        STARTUP NOMOUNT PFILE='{{ oracle_home }}/dbs/init{{ oracle_sid }}.ora';
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: nomount_result
+      when: "'pmon_' + oracle_sid not in stby_running.stdout"
+
+    - name: "PREP | Show NOMOUNT result"
+      debug:
+        msg: "{{ nomount_result.stdout_lines }}"
+      when: nomount_result.stdout_lines is defined
+
+# =========================================================================
+# PLAY 2: RUN RMAN DUPLICATE FROM PRIMARY
+# =========================================================================
+- name: Run RMAN Duplicate from active database
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "RMAN | Check if standby is already in MOUNT or OPEN state"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/sqlplus -s sys/{{ sys_password }}@{{ db_unique_name_stby }} as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT STATUS FROM V\$INSTANCE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: stby_state
+      ignore_errors: yes
+      changed_when: false
+
+    - name: "RMAN | Run RMAN Duplicate (takes ~15-30 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/rman <<EORMAN
+        CONNECT TARGET sys/{{ sys_password }}@{{ db_unique_name_pri }};
+        CONNECT AUXILIARY sys/{{ sys_password }}@{{ db_unique_name_stby }};
+        DUPLICATE TARGET DATABASE
+          FOR STANDBY
+          FROM ACTIVE DATABASE
+          DORECOVER
+          SPFILE
+            SET db_unique_name='{{ db_unique_name_stby }}'
+            SET fal_server='{{ db_unique_name_pri }}'
+            SET log_archive_config='DG_CONFIG=({{ db_unique_name_pri }},{{ db_unique_name_stby }})'
+            SET log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME={{ db_unique_name_stby }}'
+            SET log_archive_dest_2='SERVICE={{ db_unique_name_pri }} ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME={{ db_unique_name_pri }}'
+            SET audit_file_dest='{{ oracle_base }}/admin/{{ db_unique_name_stby }}/adump'
+          NOFILENAMECHECK;
+        EXIT;
+        EORMAN
+      become_user: "{{ oracle_user }}"
+      register: rman_duplicate
+      when: "'MOUNTED' not in stby_state.stdout | default('') and 'OPEN' not in stby_state.stdout | default('')"
+
+    - name: "RMAN | Show RMAN output (last 30 lines)"
+      debug:
+        msg: "{{ rman_duplicate.stdout_lines[-30:] }}"
+      when: rman_duplicate.stdout_lines is defined
+
+# =========================================================================
+# PLAY 3: POST-CONFIG ON STANDBY
+# =========================================================================
+- name: Post-configuration on standby
+  hosts: standby
+  become: yes
+
+  tasks:
+    - name: "POST | Start Managed Recovery (MRP)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: mrp_start
+
+    - name: "POST | Show MRP result"
+      debug:
+        msg: "{{ mrp_start.stdout_lines }}"
+
+    - name: "POST | Register standby with Oracle Restart"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/bin/srvctl add database \
+          -db {{ db_unique_name_stby }} \
+          -oraclehome {{ oracle_home }} \
+          -instance {{ oracle_sid }} \
+          -startoption MOUNT \
+          -role PHYSICAL_STANDBY \
+          -policy AUTOMATIC
+      become_user: "{{ oracle_user }}"
+      ignore_errors: yes
+
+    - name: "POST | Enable DG Broker on standby"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER SYSTEM SET dg_broker_start=TRUE SCOPE=BOTH;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+
+# =========================================================================
+# PLAY 4: ENABLE LOG SHIPPING ON PRIMARY
+# =========================================================================
+- name: Enable log shipping on primary
+  hosts: primary
+  become: yes
+
+  tasks:
+    - name: "SHIP | Enable log_archive_dest_state_2"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER SYSTEM SET log_archive_dest_state_2=ENABLE SCOPE=BOTH;
+        ALTER SYSTEM SWITCH LOGFILE;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: enable_ship
+
+    - name: "SHIP | Show result"
+      debug:
+        msg: "{{ enable_ship.stdout_lines }}"
+
+# =========================================================================
+# PLAY 5: VALIDATION
+# =========================================================================
+- name: Validate Data Guard configuration
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "VALIDATE | Check database role and status"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET LINESIZE 120
+        COL db_unique_name FORMAT A15
+        COL open_mode FORMAT A20
+        COL database_role FORMAT A20
+        COL switchover_status FORMAT A20
+        SELECT db_unique_name, open_mode, database_role, switchover_status
+        FROM v\$database;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: db_status
+      changed_when: false
+
+    - name: "VALIDATE | Check archive log apply (standby only)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET LINESIZE 120
+        COL name FORMAT A20
+        COL value FORMAT A30
+        COL datum FORMAT A10
+        SELECT name, value, datum_time datum
+        FROM v\$dataguard_stats
+        WHERE name IN ('transport lag','apply lag','apply finish time');
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: dg_stats
+      changed_when: false
+      when: inventory_hostname in groups['standby']
+
+    - name: "VALIDATE | Check MRP process (standby only)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET LINESIZE 100
+        COL process FORMAT A10
+        COL status FORMAT A15
+        COL thread# FORMAT 99
+        COL sequence# FORMAT 9999
+        SELECT process, status, thread#, sequence#
+        FROM v\$managed_standby
+        WHERE process IN ('ARCH','MRP0','RFS');
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: mrp_status
+      changed_when: false
+      when: inventory_hostname in groups['standby']
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "=== Database Status ({{ inventory_hostname }}) ==="
+          - "{{ db_status.stdout_lines }}"
+          - "=== Data Guard Stats ==="
+          - "{{ dg_stats.stdout_lines | default('N/A - primary server') }}"
+          - "=== MRP Process ==="
+          - "{{ mrp_status.stdout_lines | default('N/A - primary server') }}"
+

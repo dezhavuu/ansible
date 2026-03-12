@@ -1,0 +1,190 @@
+---
+# =============================================================================
+# Oracle 19c — Data Guard Broker Configuration
+# Variables from group_vars/all.yml: oracle_user
+# Variables from inventory: oracle_home, oracle_sid,
+#   db_unique_name_pri/stby, sys_password
+# =============================================================================
+
+# =========================================================================
+# PLAY 1: CLEAR MANUAL DG PARAMS (BROKER TAKES OVER)
+# =========================================================================
+- name: Prepare for DG Broker (clear manual params)
+  hosts: oracle_servers
+  become: yes
+  vars:
+    dg_config_name: DG_CDBTEST
+
+  tasks:
+    - name: "PREP | Check if database is running"
+      shell: "ps -ef | grep pmon_{{ oracle_sid }} | grep -v grep || true"
+      register: db_running
+      changed_when: false
+
+    - name: "PREP | Reset log_archive_dest_2 (Broker will manage this)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER SYSTEM RESET log_archive_dest_2 SCOPE=BOTH;
+        ALTER SYSTEM SET log_archive_dest_state_2=ENABLE SCOPE=BOTH;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      when: "'pmon_' + oracle_sid in db_running.stdout"
+      register: reset_dest2
+      ignore_errors: yes
+
+# =========================================================================
+# PLAY 2: CONFIGURE DG BROKER
+# =========================================================================
+- name: Configure Data Guard Broker
+  hosts: primary
+  become: yes
+  vars:
+    dg_config_name: DG_CDBTEST
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: CHECK PREREQUISITES
+    # =========================================================================
+    - name: "CHECK | Verify DG Broker is running on primary"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT value FROM v\$parameter WHERE name='dg_broker_start';
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: broker_primary
+      changed_when: false
+
+    - name: "CHECK | Verify DG Broker is running on standby"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/sqlplus -s sys/{{ sys_password }}@{{ db_unique_name_stby }} as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT value FROM v\$parameter WHERE name='dg_broker_start';
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: broker_standby
+      changed_when: false
+
+    - name: "CHECK | Show broker status"
+      debug:
+        msg:
+          - "DG Broker Primary: {{ broker_primary.stdout | trim }}"
+          - "DG Broker Standby: {{ broker_standby.stdout | trim }}"
+
+    # =========================================================================
+    # PHASE 2: REMOVE OLD CONFIG IF INCOMPLETE
+    # =========================================================================
+    - name: "BROKER | Check if configuration already exists"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: dgmgrl_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "BROKER | Remove incomplete configuration"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        REMOVE CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      when: "'SUCCESS' in dgmgrl_check.stdout and db_unique_name_stby not in dgmgrl_check.stdout"
+
+    # =========================================================================
+    # PHASE 3: CREATE BROKER CONFIGURATION
+    # =========================================================================
+    - name: "BROKER | Check configuration status after cleanup"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: dgmgrl_recheck
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "BROKER | Create DG Broker configuration"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        CREATE CONFIGURATION '{{ dg_config_name }}'
+          AS PRIMARY DATABASE IS '{{ db_unique_name_pri }}'
+          CONNECT IDENTIFIER IS '{{ db_unique_name_pri }}';
+        ADD DATABASE '{{ db_unique_name_stby }}'
+          AS CONNECT IDENTIFIER IS '{{ db_unique_name_stby }}'
+          MAINTAINED AS PHYSICAL;
+        ENABLE CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: broker_create
+      when: "'ORA-16532' in dgmgrl_recheck.stdout or 'not yet created' in dgmgrl_recheck.stdout | lower"
+
+    - name: "BROKER | Show creation result"
+      debug:
+        msg: "{{ broker_create.stdout_lines }}"
+      when: broker_create.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 4: VALIDATION
+    # =========================================================================
+    - name: "VALIDATE | Wait for broker to sync (15 seconds)"
+      pause:
+        seconds: 15
+
+    - name: "VALIDATE | Show Configuration"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: show_config
+      changed_when: false
+
+    - name: "VALIDATE | Show Primary Database"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_pri }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: show_primary
+      changed_when: false
+
+    - name: "VALIDATE | Show Standby Database"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: show_standby
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "=== DG Broker Configuration ==="
+          - "{{ show_config.stdout_lines }}"
+          - "=== Primary Database ==="
+          - "{{ show_primary.stdout_lines }}"
+          - "=== Standby Database ==="
+          - "{{ show_standby.stdout_lines }}"
+

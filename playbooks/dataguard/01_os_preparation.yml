@@ -1,0 +1,350 @@
+---
+# =============================================================================
+# Oracle 19c  OS Preparation Playbook
+# Variables from group_vars/all.yml: oracle_user, oracle_uid, iso_mount
+# Variables from inventory: oracle_base, oracle_home, grid_home, oracle_inventory
+# Single oracle user owns both GI and DB
+# =============================================================================
+- name: Oracle 19c OS Preparation
+  hosts: oracle_servers
+  become: yes
+  vars:
+    # -------------------------------------------------------------------------
+    # Oracle User/Group Configuration
+    # -------------------------------------------------------------------------
+    oracle_user: oracle
+    oracle_uid: 54321
+    oracle_password: oracle
+    oracle_groups:
+      - { name: oinstall,  gid: 54321 }
+      - { name: dba,       gid: 54322 }
+      - { name: oper,      gid: 54323 }
+      - { name: backupdba, gid: 54324 }
+      - { name: dgdba,     gid: 54325 }
+      - { name: kmdba,     gid: 54326 }
+      - { name: racdba,    gid: 54330 }
+      - { name: asmadmin,  gid: 54327 }
+      - { name: asmdba,    gid: 54328 }
+      - { name: asmoper,   gid: 54329 }
+
+    # -------------------------------------------------------------------------
+    # Directory Structure
+    # -------------------------------------------------------------------------
+    oracle_base: /u01/app/oracle
+    oracle_home: /u01/app/oracle/product/19.0.0/dbhome_1
+    grid_base: /u01/app/oracle
+    grid_home: /u01/app/19.0.0/grid
+    oracle_inventory: /u01/app/oraInventory
+
+    # -------------------------------------------------------------------------
+    # ASM Disk Configuration
+    # -------------------------------------------------------------------------
+    asm_disks:
+      - { device: /dev/sdb, partition: /dev/sdb1, label: DATA1 }
+      - { device: /dev/sdc, partition: /dev/sdc1, label: FRA1  }
+
+    # -------------------------------------------------------------------------
+    # ISO repo path
+    # -------------------------------------------------------------------------
+    iso_mount: /mnt/iso
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: LOCAL YUM REPO
+    # =========================================================================
+    - name: "REPO | Disable all existing repos"
+      shell: dnf config-manager --disable '*'
+      args:
+        warn: false
+
+    - name: "REPO | Configure BaseOS local repo"
+      copy:
+        dest: /etc/yum.repos.d/local-baseos.repo
+        content: |
+          [local-baseos]
+          name=Oracle Linux 8.10 BaseOS (local ISO)
+          baseurl=file://{{ iso_mount }}/BaseOS
+          enabled=1
+          gpgcheck=1
+          gpgkey=file://{{ iso_mount }}/RPM-GPG-KEY-oracle
+
+    - name: "REPO | Configure AppStream local repo"
+      copy:
+        dest: /etc/yum.repos.d/local-appstream.repo
+        content: |
+          [local-appstream]
+          name=Oracle Linux 8.10 AppStream (local ISO)
+          baseurl=file://{{ iso_mount }}/AppStream
+          enabled=1
+          gpgcheck=1
+          gpgkey=file://{{ iso_mount }}/RPM-GPG-KEY-oracle
+
+    - name: "REPO | Clean dnf cache"
+      shell: dnf clean all
+      args:
+        warn: false
+
+    - name: "REPO | Verify repos are working"
+      shell: dnf repolist
+      register: repolist
+      changed_when: false
+
+    - name: "REPO | Show available repos"
+      debug:
+        msg: "{{ repolist.stdout_lines }}"
+      when: repolist.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 2: INSTALL PACKAGES
+    # =========================================================================
+    - name: "PACKAGES | Install Oracle preinstall and required packages"
+      yum:
+        name:
+          - oracle-database-preinstall-21c
+            #- oracleasm-support
+            #- kmod-oracleasm
+          - xorg-x11-xauth
+          - xorg-x11-utils
+          - xterm
+          - nfs-utils
+          - smartmontools
+          - sysstat
+            #- rlwrap
+          - unzip
+          - tar
+          - gzip
+          - net-tools
+          - bind-utils
+          - traceroute
+          - psmisc
+        state: present
+
+    # =========================================================================
+    # PHASE 3: GROUPS AND USERS
+    # =========================================================================
+    - name: "GROUPS | Create all Oracle groups"
+      group:
+        name: "{{ item.name }}"
+        gid: "{{ item.gid }}"
+        state: present
+      loop: "{{ oracle_groups }}"
+
+    - name: "USERS | Configure oracle user (owns GI + DB)"
+      user:
+        name: "{{ oracle_user }}"
+        uid: "{{ oracle_uid }}"
+        group: oinstall
+        groups: dba,oper,backupdba,dgdba,kmdba,racdba,asmadmin,asmdba,asmoper
+        home: /home/oracle
+        shell: /bin/bash
+        state: present
+
+    - name: "USERS | Set oracle password"
+      shell: echo "{{ oracle_user }}:{{ oracle_password }}" | chpasswd
+      args:
+        warn: false
+
+    # =========================================================================
+    # PHASE 4: DIRECTORY STRUCTURE
+    # =========================================================================
+    - name: "DIRS | Create Oracle directory structure"
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: oracle
+        group: oinstall
+        mode: '0775'
+      loop:
+        - /u01
+        - "{{ oracle_base }}"
+        - "{{ oracle_home }}"
+        - "{{ oracle_inventory }}"
+        - "{{ grid_home }}"
+
+    # =========================================================================
+    # PHASE 5: KERNEL PARAMETERS
+    # =========================================================================
+    - name: "KERNEL | Set sysctl parameters"
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-oracle.conf
+      loop:
+        - { key: "fs.file-max",                     value: "6815744" }
+        - { key: "kernel.sem",                      value: "250 32000 100 128" }
+        - { key: "kernel.shmmni",                   value: "4096" }
+        - { key: "kernel.shmall",                   value: "1073741824" }
+        - { key: "kernel.shmmax",                   value: "4398046511104" }
+        - { key: "kernel.panic_on_oops",            value: "1" }
+        - { key: "net.core.rmem_default",           value: "262144" }
+        - { key: "net.core.rmem_max",               value: "4194304" }
+        - { key: "net.core.wmem_default",           value: "262144" }
+        - { key: "net.core.wmem_max",               value: "1048576" }
+        - { key: "net.ipv4.conf.all.rp_filter",     value: "2" }
+        - { key: "net.ipv4.conf.default.rp_filter",  value: "2" }
+        - { key: "fs.aio-max-nr",                   value: "1048576" }
+        - { key: "net.ipv4.ip_local_port_range",    value: "9000 65500" }
+
+    # =========================================================================
+    # PHASE 6: RESOURCE LIMITS
+    # =========================================================================
+    - name: "LIMITS | Set Oracle user limits"
+      copy:
+        dest: /etc/security/limits.d/99-oracle.conf
+        content: |
+          oracle   soft   nofile    1024
+          oracle   hard   nofile    65536
+          oracle   soft   nproc     2047
+          oracle   hard   nproc     16384
+          oracle   soft   stack     10240
+          oracle   hard   stack     32768
+          oracle   soft   memlock   unlimited
+          oracle   hard   memlock   unlimited
+
+    # =========================================================================
+    # PHASE 7: BASH PROFILE
+    # =========================================================================
+    - name: "PROFILE | Create oracle .bash_profile"
+      copy:
+        dest: /home/oracle/.bash_profile
+        owner: oracle
+        group: oinstall
+        mode: '0644'
+        content: |
+          # Oracle Environment
+          export ORACLE_BASE={{ oracle_base }}
+          export GRID_HOME={{ grid_home }}
+          export ORACLE_HOME={{ oracle_home }}
+          export ORACLE_SID=changeme
+          export PATH=$ORACLE_HOME/bin:$GRID_HOME/bin:$PATH
+          export LD_LIBRARY_PATH=$ORACLE_HOME/lib:/lib:/usr/lib
+          export NLS_LANG=AMERICAN_AMERICA.AL32UTF8
+          export NLS_DATE_FORMAT="DD.MM.YYYY HH24:MI:SS"
+          #alias sqlp='rlwrap sqlplus / as sysdba'
+          #alias rman='rlwrap rman'
+          #alias asmcmd='rlwrap asmcmd'
+          umask 022
+
+    # =========================================================================
+    # PHASE 8: ASM DISK PREPARATION
+    # =========================================================================
+    - name: "ASM | Partition disks"
+      shell: |
+        if ! blkid {{ item.partition }} > /dev/null 2>&1; then
+          /usr/sbin/parted -s {{ item.device }} mklabel gpt
+          /usr/sbin/parted -s {{ item.device }} mkpart primary 0% 100%
+          echo "PARTITIONED"
+        else
+          echo "ALREADY_DONE"
+        fi
+      register: partition_result
+      changed_when: "'PARTITIONED' in partition_result.stdout"
+      loop: "{{ asm_disks }}"
+
+    - name: "ASM | Create udev rules for ASM disks"
+      copy:
+        dest: /etc/udev/rules.d/99-oracle-asm.rules
+        content: |
+          # ASM Disk Rules  DATA diskgroup (sdb1)
+          ACTION=="add|change", KERNEL=="sdb1", ENV{ID_PART_TABLE_TYPE}=="gpt", OWNER="oracle", GROUP="oinstall", MODE="0660"
+          # ASM Disk Rules  FRA diskgroup (sdc1)
+          ACTION=="add|change", KERNEL=="sdc1", ENV{ID_PART_TABLE_TYPE}=="gpt", OWNER="oracle", GROUP="oinstall", MODE="0660"
+
+    - name: "ASM | Reload udev rules"
+      shell: |
+        /usr/sbin/udevadm control --reload-rules
+        /usr/sbin/udevadm trigger --subsystem-match=block
+      args:
+        warn: false
+
+    - name: "ASM | Verify disk permissions"
+      shell: "ls -la {{ item.partition }}"
+      register: disk_perms
+      changed_when: false
+      loop: "{{ asm_disks }}"
+
+    - name: "ASM | Show disk permissions"
+      debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ disk_perms.results }}"
+
+    # =========================================================================
+    # PHASE 9: NETWORK / HOSTS
+    # =========================================================================
+    - name: "NETWORK | Add host entries"
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item }}"
+        state: present
+      loop:
+        - "192.168.178.21  dghost-001"
+        - "192.168.178.22  dghost-002"
+
+    # =========================================================================
+    # PHASE 10: FIREWALL & SELINUX
+    # =========================================================================
+    - name: "FIREWALL | Open Oracle listener port 1521"
+      firewalld:
+        port: 1521/tcp
+        permanent: yes
+        state: enabled
+        immediate: yes
+      ignore_errors: yes
+
+    - name: "SELINUX | Set to permissive"
+      selinux:
+        policy: targeted
+        state: permissive
+
+    # =========================================================================
+    # PHASE 11: SSH KEY EXCHANGE FOR ORACLE USER
+    # =========================================================================
+    - name: "SSH | Create .ssh directory for oracle"
+      file:
+        path: /home/oracle/.ssh
+        state: directory
+        owner: oracle
+        group: oinstall
+        mode: '0700'
+
+    - name: "SSH | Generate SSH key for oracle user"
+      shell: |
+        if [ ! -f /home/oracle/.ssh/id_rsa ]; then
+          ssh-keygen -t rsa -b 4096 -f /home/oracle/.ssh/id_rsa -N ""
+          chown oracle:oinstall /home/oracle/.ssh/id_rsa /home/oracle/.ssh/id_rsa.pub
+          echo "GENERATED"
+        else
+          echo "EXISTS"
+        fi
+      register: ssh_key
+      changed_when: "'GENERATED' in ssh_key.stdout"
+
+    # =========================================================================
+    # PHASE 12: FINAL VALIDATION
+    # =========================================================================
+    - name: "VALIDATE | Check oracle user"
+      shell: id oracle
+      register: oracle_id
+      changed_when: false
+
+    - name: "VALIDATE | Check directory structure"
+      shell: "ls -ld /u01 {{ oracle_base }} {{ oracle_home }} {{ grid_home }} {{ oracle_inventory }}"
+      register: dirs_check
+      changed_when: false
+
+    - name: "VALIDATE | Check ASM disk permissions"
+      shell: "ls -la /dev/sdb1 /dev/sdc1"
+      register: asm_check
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "Oracle user: {{ oracle_id.stdout }}"
+          - "Directories:"
+          - "{{ dirs_check.stdout_lines }}"
+          - "ASM Disks:"
+          - "{{ asm_check.stdout_lines }}"
+

@@ -1,0 +1,44 @@
+[primary]
+dghost-001 ansible_host=192.168.178.21
+
+[standby]
+dghost-002 ansible_host=192.168.178.22
+
+[oracle_servers:children]
+primary
+standby
+
+[oracle_servers:vars]
+ansible_user=sef
+ansible_python_interpreter=/usr/bin/python3.6
+
+# Oracle User
+oracle_user=oracle
+oracle_uid=54321
+iso_mount=/mnt/iso
+
+# Directory Structure
+oracle_base=/u01/app/oracle
+oracle_inventory=/u01/app/oraInventory
+oracle_home=/u01/app/oracle/product/19.0.0/dbhome_1
+grid_home=/u01/app/19.0.0/grid
+
+# Database
+oracle_sid=CDBTEST
+db_unique_name_pri=CDBTEST_001
+db_unique_name_stby=CDBTEST_002
+pdb_name=PDBTEST
+sys_password={{ vault_sys_password }}
+system_password={{ vault_system_password }}
+
+# Patching
+patch_target_version=19.27
+patch_dir=/home/oracle/dbadmin/ansible/files/19c/patches
+patch_stage=/tmp/patches
+gi_patch_zip=p37641958_190000_Linux-x86-64.zip
+gi_patch_number=37641958
+db_patch_zip=p37642901_190000_Linux-x86-64.zip
+db_patch_number=37642901
+ojvm_patch_zip=p37499406_190000_Linux-x86-64.zip
+ojvm_patch_number=37499406
+opatch_zip=p6880880_190000_Linux-x86-64.zip

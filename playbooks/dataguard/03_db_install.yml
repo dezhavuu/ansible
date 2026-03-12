@@ -1,0 +1,161 @@
+---
+# =============================================================================
+# Oracle 19c  Database Software Installation (Software Only)
+# Variables from group_vars/all.yml: oracle_user
+# Variables from inventory: oracle_base, oracle_home, oracle_inventory
+# =============================================================================- 
+- name: Oracle 19c Database Software Installation
+  hosts: oracle_servers
+  become: yes
+  vars:
+    db_zip: /home/oracle/dbadmin/ansible/files/19c/LINUX.X64_193000_db_home.zip
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: COPY DB ZIP TO SERVERS
+    # =========================================================================
+    - name: "COPY | Check if DB ZIP already exists on target"
+      stat:
+        path: /tmp/LINUX.X64_193000_db_home.zip
+      register: db_zip_exists
+
+    - name: "COPY | Copy Database ZIP to target (takes ~5-10 min)"
+      copy:
+        src: "{{ db_zip }}"
+        dest: /tmp/LINUX.X64_193000_db_home.zip
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0644'
+      when: not db_zip_exists.stat.exists
+
+    # =========================================================================
+    # PHASE 2: UNZIP INTO ORACLE_HOME
+    # =========================================================================
+    - name: "UNZIP | Check if already unzipped"
+      stat:
+        path: "{{ oracle_home }}/bin/sqlplus"
+      register: sqlplus_exists
+
+    - name: "UNZIP | Unzip Database Software into ORACLE_HOME"
+      shell: |
+        cd {{ oracle_home }}
+        unzip -oq /tmp/LINUX.X64_193000_db_home.zip
+      become_user: "{{ oracle_user }}"
+      when: not sqlplus_exists.stat.exists
+
+    # =========================================================================
+    # PHASE 3: CREATE RESPONSE FILE
+    # =========================================================================
+    - name: "RESPONSE | Create DB silent install response file"
+      copy:
+        dest: /tmp/db_install.rsp
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0600'
+        content: |
+          oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v19.0.0
+          oracle.install.option=INSTALL_DB_SWONLY
+          UNIX_GROUP_NAME=oinstall
+          INVENTORY_LOCATION={{ oracle_inventory }}
+          ORACLE_HOME={{ oracle_home }}
+          ORACLE_BASE={{ oracle_base }}
+          oracle.install.db.InstallEdition=EE
+          oracle.install.db.OSDBA_GROUP=dba
+          oracle.install.db.OSOPER_GROUP=oper
+          oracle.install.db.OSBACKUPDBA_GROUP=backupdba
+          oracle.install.db.OSDGDBA_GROUP=dgdba
+          oracle.install.db.OSKMDBA_GROUP=kmdba
+          oracle.install.db.OSRACDBA_GROUP=racdba
+          oracle.install.db.rootconfig.executeRootScript=false
+          oracle.install.db.ConfigureAsContainerDB=false
+          DECLINE_SECURITY_UPDATES=true
+
+    # =========================================================================
+    # PHASE 4: RUN DATABASE INSTALLER
+    # =========================================================================
+    - name: "INSTALL | Check if DB software is already installed"
+      shell: "grep '{{ oracle_home }}' {{ oracle_inventory }}/ContentsXML/inventory.xml || true"
+      register: db_installed
+      changed_when: false
+
+    - name: "INSTALL | Run Database installer (takes ~10-15 min)"
+      shell: |
+        export CV_ASSUME_DISTID=OL8
+        {{ oracle_home }}/runInstaller -silent \
+          -responseFile /tmp/db_install.rsp \
+          -waitforcompletion \
+          2>&1 | tee /tmp/db_install.log
+        exit 0
+      become_user: "{{ oracle_user }}"
+      environment:
+        CV_ASSUME_DISTID: OL8
+      register: db_install
+      when: "'dbhome_1' not in db_installed.stdout"
+
+    - name: "INSTALL | Show installer output"
+      debug:
+        msg: "{{ db_install.stdout_lines }}"
+      when: db_install.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 5: RUN ROOT SCRIPT
+    # =========================================================================
+    - name: "ROOT | Check if root.sh was already executed"
+      shell: "grep '{{ oracle_home }}' /etc/oratab || true"
+      register: oratab_check
+      changed_when: false
+
+    - name: "ROOT | Run root.sh"
+      shell: "{{ oracle_home }}/root.sh 2>&1 | tee /tmp/db_root_sh.log"
+      register: db_root_sh
+      when: "'dbhome_1' not in oratab_check.stdout"
+
+    - name: "ROOT | Show root.sh output"
+      debug:
+        msg: "{{ db_root_sh.stdout_lines }}"
+      when: db_root_sh.stdout_lines is defined
+
+    # =========================================================================
+    # PHASE 6: VALIDATION
+    # =========================================================================
+    - name: "VALIDATE | Check Oracle binary version"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/sqlplus -V
+      become_user: "{{ oracle_user }}"
+      register: sqlplus_version
+      changed_when: false
+
+    - name: "VALIDATE | Check OPatch version"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/OPatch/opatch version
+      become_user: "{{ oracle_user }}"
+      register: opatch_version
+      changed_when: false
+
+    - name: "VALIDATE | Check Oracle Inventory"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/OPatch/opatch lsinventory | head -20
+      become_user: "{{ oracle_user }}"
+      register: inventory_check
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
+      debug:
+        msg:
+          - "=== SQL*Plus Version ==="
+          - "{{ sqlplus_version.stdout }}"
+          - "=== OPatch Version ==="
+          - "{{ opatch_version.stdout }}"
+          - "=== Oracle Inventory ==="
+          - "{{ inventory_check.stdout_lines }}"
+
+    # =========================================================================
+    # PHASE 7: CLEANUP
+    # =========================================================================
+    - name: "CLEANUP | Remove DB ZIP from /tmp"
+      file:
+        path: /tmp/LINUX.X64_193000_db_home.zip
+        state: absent

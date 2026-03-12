@@ -1,0 +1,77 @@
+---
+# =============================================================================
+# STEP 1: Distribute patches + update OPatch
+# Works for: Data Guard AND Standalone
+# Variables from inventory: oracle_user, oracle_home, grid_home,
+#   patch_dir, patch_stage, opatch_zip
+# =============================================================================
+- name: "STEP 1: Distribute patches and update OPatch"
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "STAGE | Create patch staging directory"
+      file:
+        path: "{{ patch_stage }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: '0755'
+
+    - name: "STAGE | Copy OPatch"
+      copy:
+        src: "{{ patch_dir }}/{{ opatch_zip }}"
+        dest: "{{ patch_stage }}/"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+
+    # --- GI OPatch ---
+    - name: "OPATCH | Check if GRID_HOME OPatch already updated"
+      shell: "{{ grid_home }}/OPatch/opatch version | head -1"
+      become_user: "{{ oracle_user }}"
+      register: gi_opatch_ver
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "OPATCH | Backup current OPatch in GRID_HOME"
+      shell: "mv {{ grid_home }}/OPatch {{ grid_home }}/OPatch.bak.$(date +%Y%m%d)"
+      args:
+        creates: "{{ grid_home }}/OPatch.bak.*"
+
+    - name: "OPATCH | Update OPatch in GRID_HOME (as root, chown to oracle)"
+      shell: "unzip -oq {{ patch_stage }}/{{ opatch_zip }} -d {{ grid_home }} && chown -R {{ oracle_user }}:oinstall {{ grid_home }}/OPatch"
+
+    # --- DB OPatch ---
+    - name: "OPATCH | Backup current OPatch in ORACLE_HOME"
+      shell: "mv {{ oracle_home }}/OPatch {{ oracle_home }}/OPatch.bak.$(date +%Y%m%d)"
+      become_user: "{{ oracle_user }}"
+      args:
+        creates: "{{ oracle_home }}/OPatch.bak.*"
+
+    - name: "OPATCH | Update OPatch in ORACLE_HOME"
+      shell: "unzip -oq {{ patch_stage }}/{{ opatch_zip }} -d {{ oracle_home }}"
+      become_user: "{{ oracle_user }}"
+
+    # --- Verify ---
+    - name: "OPATCH | Verify OPatch version GI"
+      shell: "{{ grid_home }}/OPatch/opatch version"
+      become_user: "{{ oracle_user }}"
+      register: gi_opatch
+      changed_when: false
+
+    - name: "OPATCH | Verify OPatch version DB"
+      shell: "{{ oracle_home }}/OPatch/opatch version"
+      become_user: "{{ oracle_user }}"
+      register: db_opatch
+      changed_when: false
+
+    - name: "OPATCH | Show versions"
+      debug:
+        msg:
+          - "GI OPatch: {{ gi_opatch.stdout_lines[0] }}"
+          - "DB OPatch: {{ db_opatch.stdout_lines[0] }}"
+
+    - name: "STAGE | Remove OPatch zip"
+      file:
+        path: "{{ patch_stage }}/{{ opatch_zip }}"
+        state: absent

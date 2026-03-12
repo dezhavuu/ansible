@@ -1,0 +1,156 @@
+---
+# =============================================================================
+# STEP 3: Switchover — Standby becomes Primary
+# Works for: Data Guard only
+# Ensures MRP is running and Apply Lag is 0 before switchover
+# Variables from inventory: oracle_user, oracle_home, oracle_sid,
+#   db_unique_name_pri, db_unique_name_stby, sys_password
+# =============================================================================
+- name: "STEP 3: Switchover — Standby becomes Primary"
+  hosts: primary
+  become: yes
+
+  tasks:
+    # =========================================================================
+    # PRE-SWITCHOVER CHECKS
+    # =========================================================================
+    - name: "PRE-CHECK | Verify DG config is SUCCESS"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: pre_config
+      changed_when: false
+
+    - name: "PRE-CHECK | Show configuration"
+      debug:
+        msg: "{{ pre_config.stdout_lines }}"
+
+    - name: "PRE-CHECK | Abort if configuration is not SUCCESS"
+      fail:
+        msg: "DG Configuration is not SUCCESS — switchover not safe. Fix manually before retrying."
+      when: "'SUCCESS' not in pre_config.stdout"
+
+    - name: "PRE-CHECK | Ensure MRP is running (APPLY-ON)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-ON';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+
+    - name: "PRE-CHECK | Wait for Apply Lag = 0 and STATUS = SUCCESS (max 10 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SHOW DATABASE '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: stby_lag
+      until: "'Apply Lag:      0 seconds' in stby_lag.stdout and 'SUCCESS' in stby_lag.stdout"
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: "PRE-CHECK | Verify switchover_status on standby"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/sqlplus -s sys/{{ sys_password }}@{{ db_unique_name_stby }} as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF
+        SELECT switchover_status FROM v\$database;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: stby_switchover_status
+      changed_when: false
+
+    - name: "PRE-CHECK | Show switchover_status"
+      debug:
+        msg: "Standby switchover_status: {{ stby_switchover_status.stdout | trim }}"
+
+    - name: "PRE-CHECK | Abort if standby not ready for switchover"
+      fail:
+        msg: "Standby switchover_status is '{{ stby_switchover_status.stdout | trim }}' — expected 'TO PRIMARY' or 'NOT ALLOWED'. MRP may not be running. Fix manually."
+      when: "'TO PRIMARY' not in stby_switchover_status.stdout and 'NOT ALLOWED' not in stby_switchover_status.stdout"
+
+    # =========================================================================
+    # EXECUTE SWITCHOVER
+    # =========================================================================
+    - name: "SWITCHOVER | Execute switchover to standby"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        SWITCHOVER TO '{{ db_unique_name_stby }}';
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchover_result
+
+    - name: "SWITCHOVER | Show switchover result"
+      debug:
+        msg: "{{ switchover_result.stdout_lines }}"
+
+    # =========================================================================
+    # POST-SWITCHOVER VALIDATION
+    # =========================================================================
+    - name: "POST-CHECK | Wait for switchover to complete (max 5 min)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        SHOW CONFIGURATION;
+        EXIT;
+        EODG
+      become_user: "{{ oracle_user }}"
+      register: switchover_check
+      until: "'SUCCESS' in switchover_check.stdout and db_unique_name_stby + ' - Primary' in switchover_check.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: "POST-CHECK | Switchover failed — retry with MRP fix"
+      block:
+        - name: "RETRY | Ensure MRP on new standby"
+          shell: |
+            export ORACLE_HOME={{ oracle_home }}
+            {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+            EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-ON';
+            EXIT;
+            EODG
+          become_user: "{{ oracle_user }}"
+
+        - name: "RETRY | Wait and retry switchover"
+          shell: |
+            export ORACLE_HOME={{ oracle_home }}
+            {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+            SWITCHOVER TO '{{ db_unique_name_stby }}';
+            EXIT;
+            EODG
+          become_user: "{{ oracle_user }}"
+
+        - name: "RETRY | Wait for switchover to complete (max 5 min)"
+          shell: |
+            export ORACLE_HOME={{ oracle_home }}
+            {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+            SHOW CONFIGURATION;
+            EXIT;
+            EODG
+          become_user: "{{ oracle_user }}"
+          register: retry_check
+          until: "'SUCCESS' in retry_check.stdout and db_unique_name_stby + ' - Primary' in retry_check.stdout"
+          retries: 30
+          delay: 10
+          changed_when: false
+      when: switchover_check is failed
+      rescue:
+        - name: "FATAL | Switchover failed after retry"
+          fail:
+            msg: "Switchover failed even after MRP fix. Manual intervention required."
+
+    - name: "POST-CHECK | Show final status"
+      debug:
+        msg: "{{ switchover_check.stdout_lines }}"
+      when: switchover_check is succeeded
