@@ -1,0 +1,59 @@
+---
+# =============================================================================
+# Oracle 19c  rlwrap Installation + Alias Aktivierung
+# Voraussetzung: Internetverbindung vorhanden
+# Variables from inventory: oracle_user, oracle_base, oracle_home, grid_home
+# =============================================================================
+- name: Install rlwrap and activate aliases
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    # =========================================================================
+    # PHASE 1: EPEL REPO
+    # =========================================================================
+    - name: "EPEL | Install Oracle EPEL release package"
+      yum:
+        name: oracle-epel-release-el8
+        state: present
+
+    # =========================================================================
+    # PHASE 2: INSTALL RLWRAP
+    # =========================================================================
+    - name: "RLWRAP | Install rlwrap"
+      yum:
+        name: rlwrap
+        state: present
+
+    - name: "RLWRAP | Verify installation"
+      shell: rlwrap --version
+      register: rlwrap_version
+      changed_when: false
+
+    - name: "RLWRAP | Show version"
+      debug:
+        msg: "{{ rlwrap_version.stdout }}"
+
+    # =========================================================================
+    # PHASE 3: ACTIVATE ALIASES IN BASH_PROFILE
+    # =========================================================================
+    - name: "PROFILE | Activate rlwrap aliases in .bash_profile"
+      replace:
+        path: /home/oracle/.bash_profile
+        regexp: "{{ item.from }}"
+        replace: "{{ item.to }}"
+        owner: oracle
+        group: oinstall
+      loop:
+        - { from: "#alias sqlp='rlwrap sqlplus / as sysdba'", to: "alias sqlp='rlwrap sqlplus / as sysdba'" }
+        - { from: "#alias rman='rlwrap rman'",                to: "alias rman='rlwrap rman'" }
+        - { from: "#alias asmcmd='rlwrap asmcmd'",            to: "alias asmcmd='rlwrap asmcmd'" }
+
+    - name: "PROFILE | Show updated .bash_profile aliases"
+      shell: grep -E "alias (sqlp|rman|asmcmd)" /home/oracle/.bash_profile
+      register: alias_check
+      changed_when: false
+
+    - name: "PROFILE | Show aliases"
+      debug:
+        msg: "{{ alias_check.stdout_lines }}"

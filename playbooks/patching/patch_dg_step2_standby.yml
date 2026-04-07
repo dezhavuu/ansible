@@ -4,7 +4,8 @@
 # Works for: Data Guard only (skipped if no standby group)
 # Patches: GI → DB → OJVM (copy, apply, delete each to save disk space)
 # Variables from inventory: oracle_user, oracle_home, grid_home, oracle_sid,
-#   db_unique_name_pri, db_unique_name_stby, sys_password,
+#   db_unique_name_pri, db_unique_name_stby
+# Variables from vault: sys_password,
 #   patch_dir, patch_stage, gi_patch_zip, gi_patch_number,
 #   db_patch_zip, db_patch_number, ojvm_patch_zip, ojvm_patch_number
 # =============================================================================

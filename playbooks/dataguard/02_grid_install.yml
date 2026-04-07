@@ -1,15 +1,14 @@
 ---
 #  =============================================================================
 # Oracle 19c  Grid Infrastructure Installation (Standalone, ASM)
-# Variables from group_vars/all.yml: oracle_user
-# Variables from inventory: oracle_base, oracle_home, grid_home, oracle_inventory
+# Variables from inventory: oracle_user, oracle_base, oracle_home, grid_home, oracle_inventory
+# Variables from vault: asm_sys_password
 # =============================================================================
 - name: Oracle 19c Grid Infrastructure Installation
   hosts: oracle_servers
   become: yes
   vars:
     grid_zip: /home/oracle/dbadmin/ansible/files/19c/LINUX.X64_193000_grid_home.zip
-    asm_sys_password: {{ vault_sys_password }}
     asm_discovery_string: "/dev/sdb1,/dev/sdc1"
 
   tasks:
@@ -245,4 +244,3 @@
       file:
         path: /tmp/LINUX.X64_193000_grid_home.zip
         state: absent
-

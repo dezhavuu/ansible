@@ -2,23 +2,41 @@
 
 ---
 
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Ansible Project Structure](#2-ansible-project-structure)
+3. [Prerequisites](#3-prerequisites)
+4. [ISO Repository](#4-iso-repository)
+5. [Phase 1: OS Preparation](#5-phase-1-os-preparation)
+6. [Phase 2: Grid Infrastructure](#6-phase-2-grid-infrastructure)
+7. [Phase 3: DB Software](#7-phase-3-db-software)
+8. [Phase 4: Primary Database](#8-phase-4-primary-database)
+9. [Phase 5: Standby Database](#9-phase-5-standby-database)
+10. [Phase 6: Data Guard Broker](#10-phase-6-data-guard-broker)
+11. [Phase 7: rlwrap (Optional)](#11-phase-7-rlwrap-optional)
+12. [Completed Tasks](#12-completed-tasks)
+13. [Ansible Quick Reference](#13-ansible-quick-reference)
+
+---
+
 ## 1. Overview
 
-| Component          | Details                                      |
-|--------------------|----------------------------------------------|
-| Primary Server     | dghost-001 (192.168.178.21)                  |
-| Standby Server     | dghost-002 (192.168.178.22)                  |
-| Ansible Controller | anshost (existing AWX Server)                |
-| Operating System   | Oracle Linux 8.10                            |
-| Oracle Version     | 19c Enterprise Edition (19.27.0.0.0)         |
-| Storage            | ASM: sdb (500G) → +DATA, sdc (100G) → +FRA  |
-| Grid Infra         | Oracle 19c GI, Standalone (Oracle Restart)   |
-| Data Guard Type    | Physical Standby                             |
-| RAM                | 16 GB per server                             |
-| Oracle User        | oracle (uid 54321) — owns GI + DB            |
-| DG Broker Config   | DG_CDBTEST                                   |
-| Primary DB         | CDBTEST_001 (SID: CDBTEST, PDB: PDBTEST)    |
-| Standby DB         | CDBTEST_002 (SID: CDBTEST)                   |
+| Component | Details |
+| --- | --- |
+| Primary Server | dghost-001 (192.168.178.21) |
+| Standby Server | dghost-002 (192.168.178.22) |
+| Ansible Controller | anshost (existing AWX Server) |
+| Operating System | Oracle Linux 8.10 |
+| Oracle Version | 19c Enterprise Edition (19.27.0.0.0) |
+| Storage | ASM: sdb (500G) → +DATA, sdc (100G) → +FRA |
+| Grid Infra | Oracle 19c GI, Standalone (Oracle Restart) |
+| Data Guard Type | Physical Standby |
+| RAM | 16 GB per server |
+| Oracle User | oracle (uid 54321) — owns GI + DB |
+| DG Broker Config | DG_CDBTEST |
+| Primary DB | CDBTEST_001 (SID: CDBTEST, PDB: PDBTEST) |
+| Standby DB | CDBTEST_002 (SID: CDBTEST) |
 
 ---
 
@@ -30,7 +48,11 @@ All Ansible files located under `/home/oracle/ansible` on anshost.
 /home/oracle/ansible/
 ├── ansible.cfg
 ├── inventory/
-│   └── dataguard-001-002                # Inventory + all variables
+│   └── dataguard-001-002/           # Inventory directory (use as template)
+│       ├── hosts                    # Hosts + variables
+│       └── group_vars/
+│           └── oracle_servers/
+│               └── vault.yml        # Encrypted passwords (ansible-vault)
 ├── playbooks/
 │   ├── dataguard/
 │   │   ├── 01_os_preparation.yml
@@ -39,7 +61,8 @@ All Ansible files located under `/home/oracle/ansible` on anshost.
 │   │   ├── 03_db_install.yml
 │   │   ├── 04_create_primary.yml
 │   │   ├── 05_create_standby.yml
-│   │   └── 06_dg_broker.yml
+│   │   ├── 06_dg_broker.yml
+│   │   └── 07_install_rlwrap.yml    # Optional: rlwrap + alias activation
 │   └── patching/
 │       ├── patch_dg_step1_prepare.yml
 │       ├── patch_dg_step2_standby.yml
@@ -63,7 +86,7 @@ All Ansible files located under `/home/oracle/ansible` on anshost.
 ```
 
 > [!tip] Scalable
-> For additional DG pairs: create a new inventory under `inventory/`.
+> For additional DG pairs: create a new inventory directory under `inventory/` with its own `hosts` and `vault.yml`.
 > The playbooks remain identical.
 
 ### 2.1 ansible.cfg
@@ -72,13 +95,16 @@ All Ansible files located under `/home/oracle/ansible` on anshost.
 [defaults]
 host_key_checking = False
 command_warnings = False
+vault_password_file = ~/.vault_pass
 
 [privilege_escalation]
 become = True
 become_method = sudo
 ```
 
-### 2.2 Inventory: `inventory/dataguard-001-002`
+`vault_password_file` — Ansible reads the vault password automatically from `~/.vault_pass`. This eliminates the need for `--ask-vault-pass` on every playbook run.
+
+### 2.2 Inventory: `inventory/dataguard-001-002/hosts`
 
 ```ini
 [primary]
@@ -111,8 +137,6 @@ oracle_sid=CDBTEST
 db_unique_name_pri=CDBTEST_001
 db_unique_name_stby=CDBTEST_002
 pdb_name=PDBTEST
-sys_password={{ vault_sys_password }}
-system_password={{ vault_system_password }}
 
 # Patching
 patch_target_version=19.27
@@ -127,6 +151,51 @@ ojvm_patch_number=37499406
 opatch_zip=p6880880_190000_Linux-x86-64.zip
 ```
 
+### 2.3 Vault: `inventory/dataguard-001-002/group_vars/oracle_servers/vault.yml`
+
+Passwords are **never** stored in `hosts`. They live in an ansible-vault encrypted file. Ansible automatically loads `group_vars/oracle_servers/` for all hosts in the `oracle_servers` group — no `vars_files` entry needed in any playbook.
+
+Create the file:
+
+```bash
+mkdir -p inventory/dataguard-001-002/group_vars/oracle_servers
+ansible-vault create inventory/dataguard-001-002/group_vars/oracle_servers/vault.yml
+```
+
+Contents (unencrypted):
+
+```yaml
+oracle_password: <oracle_os_password>
+asm_sys_password: <asm_sys_password>
+sys_password: <db_sys_password>
+system_password: <db_system_password>
+```
+
+Edit the file later:
+
+```bash
+ansible-vault edit inventory/dataguard-001-002/group_vars/oracle_servers/vault.yml
+```
+
+Store the vault password for automatic loading:
+
+```bash
+echo 'your_vault_password' > ~/.vault_pass
+chmod 600 ~/.vault_pass
+```
+
+For a second DG pair, simply create a new directory with its own independent vault:
+
+```
+inventory/
+├── dataguard-001-002/
+│   ├── hosts
+│   └── group_vars/oracle_servers/vault.yml
+└── dataguard-003-004/
+    ├── hosts
+    └── group_vars/oracle_servers/vault.yml
+```
+
 ---
 
 ## 3. Prerequisites
@@ -139,7 +208,7 @@ ssh-copy-id sef@192.168.178.21
 ssh-copy-id sef@192.168.178.22
 
 cd /home/oracle/ansible
-ansible -i inventory/dataguard-001-002 all -m ping -K
+ansible -i inventory/dataguard-001-002/ all -m ping -K
 ```
 
 ---
@@ -159,7 +228,7 @@ Both servers have no internet access. OL 8.10 ISO mounted via vSphere as CD, mou
 ### Playbook: `01_os_preparation.yml`
 
 | Phase | Description |
-|-------|-------------|
+| --- | --- |
 | 1 | Local Yum repo (BaseOS + AppStream) |
 | 2 | oracle-database-preinstall-21c + packages |
 | 3 | Oracle groups + user |
@@ -174,12 +243,13 @@ Both servers have no internet access. OL 8.10 ISO mounted via vSphere as CD, mou
 | 12 | Validation |
 
 ```bash
-ansible-playbook -i inventory/dataguard-001-002 playbooks/dataguard/01_os_preparation.yml -K
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/01_os_preparation.yml -K
 ```
 
 ### Configuration Details
 
 **Directories:**
+
 ```
 /u01/app/oracle/                         ORACLE_BASE
 /u01/app/oracle/product/19.0.0/dbhome_1  ORACLE_HOME
@@ -190,13 +260,24 @@ ansible-playbook -i inventory/dataguard-001-002 playbooks/dataguard/01_os_prepar
 **ASM Disks:**
 
 | Device | Partition | Diskgroup | Size |
-|--------|-----------|-----------|------|
+| --- | --- | --- | --- |
 | /dev/sdb | /dev/sdb1 | +DATA | 500G |
 | /dev/sdc | /dev/sdc1 | +FRA | 100G |
 
 **Kernel Parameters** (`/etc/sysctl.d/99-oracle.conf`): fs.file-max=6815744, kernel.shmmax=4398046511104, etc.
 
 **Resource Limits** (`/etc/security/limits.d/99-oracle.conf`): nofile 65536, nproc 16384, memlock unlimited.
+
+**Bash Profile** (`/home/oracle/.bash_profile`) — aliases after rlwrap installation:
+
+```bash
+alias sqlp='rlwrap sqlplus / as sysdba'
+alias rman='rlwrap rman'
+alias asmcmd='rlwrap asmcmd'
+```
+
+> [!note] rlwrap
+> Installed via EPEL (`07_install_rlwrap.yml`). The aliases are initially commented out in the bash profile and activated automatically by the playbook.
 
 ---
 
@@ -205,7 +286,7 @@ ansible-playbook -i inventory/dataguard-001-002 playbooks/dataguard/01_os_prepar
 ### Playbook: `02_grid_install.yml`
 
 | Phase | Description |
-|-------|-------------|
+| --- | --- |
 | 1-2 | Copy + extract ZIP |
 | 3-4 | Response file + silent install |
 | 5 | Root scripts |
@@ -213,7 +294,11 @@ ansible-playbook -i inventory/dataguard-001-002 playbooks/dataguard/01_os_prepar
 | 7 | Listener (NETCA) |
 | 8-9 | Validation + cleanup |
 
-Deinstallation: `02_grid_deinstall.yml`
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/02_grid_install.yml -K
+```
+
+Deinstallation: `02_grid_deinstall.yml` (no vault required)
 
 ### ASM Diskgroups
 
@@ -244,10 +329,14 @@ $ORACLE_HOME/bin/asmcmd
 ### Playbook: `03_db_install.yml`
 
 | Phase | Description |
-|-------|-------------|
+| --- | --- |
 | 1-2 | Copy + extract ZIP |
 | 3-4 | Response file + silent install (SWONLY) |
 | 5-7 | Root script + validation + cleanup |
+
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/03_db_install.yml -K
+```
 
 Installed version: SQL*Plus 19.0.0.0.0 (19.3), OPatch 12.2.0.1.17
 
@@ -259,21 +348,25 @@ Installed version: SQL*Plus 19.0.0.0.0 (19.3), OPatch 12.2.0.1.17
 
 4 plays: DBCA + DG Prep | TNS on both servers | Copy password file | Validation
 
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/04_create_primary.yml -K
+```
+
 | Parameter | Value |
-|-----------|-------|
+| --- | --- |
 | Global Database Name | CDBTEST_001 |
 | SID | CDBTEST |
 | PDB | PDBTEST |
 | Character Set | AL32UTF8 |
 | SGA / PGA | 4G / 1G |
 | Redo Logs | 100M (3 groups) |
-| Standby Redo Logs | 4 × 100M |
+| Standby Redo Logs | 4 x 100M |
 | Storage | +DATA / +FRA |
 
 ### Data Guard Parameters
 
 | Parameter | Value |
-|-----------|-------|
+| --- | --- |
 | db_unique_name | CDBTEST_001 |
 | log_archive_config | DG_CONFIG=(CDBTEST_001,CDBTEST_002) |
 | fal_server | CDBTEST_002 |
@@ -296,8 +389,12 @@ Installed version: SQL*Plus 19.0.0.0.0 (19.3), OPatch 12.2.0.1.17
 
 5 plays: Prepare NOMOUNT | RMAN Duplicate | MRP + srvctl | Log shipping | Validation
 
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/05_create_standby.yml -K
+```
+
 | Property | Value |
-|----------|-------|
+| --- | --- |
 | Data Guard Type | Physical Standby |
 | Apply Method | Redo Apply (block-for-block) |
 | Standby Open Mode | MOUNTED |
@@ -316,6 +413,10 @@ Installed version: SQL*Plus 19.0.0.0.0 (19.3), OPatch 12.2.0.1.17
 
 2 plays: Reset `log_archive_dest_2` | Create broker configuration
 
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/06_dg_broker.yml -K
+```
+
 ```
 Configuration - DG_CDBTEST
   Protection Mode: MaxPerformance
@@ -328,7 +429,7 @@ Configuration - DG_CDBTEST
 ### DG Broker Commands
 
 ```bash
-dgmgrl sys/<your_password>@CDBTEST_001
+dgmgrl sys@CDBTEST_001
 SHOW CONFIGURATION;
 SHOW DATABASE 'CDBTEST_002';
 SWITCHOVER TO 'CDBTEST_002';
@@ -341,42 +442,68 @@ VALIDATE DATABASE 'CDBTEST_002';
 
 ---
 
+## 11. Phase 7: rlwrap (Optional)
+
+### Playbook: `07_install_rlwrap.yml`
+
+Installs rlwrap via Oracle EPEL and activates the aliases in the oracle user's bash profile.
+
+```bash
+ansible-playbook -i inventory/dataguard-001-002/ playbooks/dataguard/07_install_rlwrap.yml -K
+```
+
+| Phase | Description |
+| --- | --- |
+| 1 | Install Oracle EPEL release package |
+| 2 | Install rlwrap + verify version |
+| 3 | Activate aliases in `.bash_profile` (uncomment preconfigured lines) |
+
+After installation the following aliases are available:
+
+```bash
+sqlp       # rlwrap sqlplus / as sysdba
+rman       # rlwrap rman
+asmcmd     # rlwrap asmcmd
+```
+
+> [!note]
+> This playbook requires internet access to reach the EPEL repository. On offline servers, rlwrap must be provided manually as an RPM.
+
+---
+
 ## 12. Completed Tasks
 
 | No | Task | Playbook |
-|----|------|----------|
+| --- | --- | --- |
 | 1 | OS preparation | `01_os_preparation.yml` |
 | 2 | Grid Infrastructure + ASM | `02_grid_install.yml` |
 | 3 | Oracle Database 19c software | `03_db_install.yml` |
 | 4 | Primary database + DG prep | `04_create_primary.yml` |
 | 5 | Standby database | `05_create_standby.yml` |
 | 6 | Data Guard Broker | `06_dg_broker.yml` |
-| 7 | RU Patching (19.3 → 19.27) | `patching/step1-7` |
-
-## 13. Open Tasks
-
-| No | Task |
-|----|------|
-| 1 | Encrypt passwords with ansible-vault |
-| 2 | Install rlwrap (when internet available) |
-| 3 | Test rollback playbook |
+| 7 | rlwrap + aliases | `07_install_rlwrap.yml` |
+| 8 | RU Patching (19.3 → 19.27) | `patching/step1-7` |
+| 9 | Encrypt passwords with ansible-vault | `group_vars/oracle_servers/vault.yml` |
+| 10 | Test rollback playbook | `patch_dg_rollback.yml` |
 
 ---
 
-## 14. Ansible Quick Reference
+## 13. Ansible Quick Reference
 
 Run all commands from `/home/oracle/ansible`.
 
 | Command | Description |
-|---------|-------------|
-| `ansible ... -m ping -K` | Test connectivity |
-| `ansible ... -m shell -a "..." -K` | Run single command |
-| `ansible-playbook ... <playbook> -K` | Run playbook |
-| `ansible-playbook ... --check` | Dry run |
-| `ansible-vault create secrets.yml` | Encrypt passwords |
+| --- | --- |
+| `ansible -i inventory/dataguard-001-002/ all -m ping -K` | Test connectivity |
+| `ansible -i inventory/dataguard-001-002/ all -m shell -a "uptime" -K` | Run single command |
+| `ansible-playbook -i inventory/dataguard-001-002/ <playbook> -K` | Run playbook (vault loaded automatically) |
+| `ansible-playbook -i inventory/dataguard-001-002/ <playbook> --check -K` | Dry run |
+| `ansible-vault create inventory/dataguard-001-002/group_vars/oracle_servers/vault.yml` | Create vault file |
+| `ansible-vault edit inventory/dataguard-001-002/group_vars/oracle_servers/vault.yml` | Edit vault file |
 | `ansible-doc <module>` | Module documentation |
 
 > [!note] Notes
 > - `-K` is required because user `sef` has a sudo password
+> - Vault is loaded automatically via `vault_password_file = ~/.vault_pass` in ansible.cfg
 > - `--check` may fail on `shell` tasks
-> - For new DG pairs: copy inventory, adjust values, reuse playbooks
+> - For new DG pairs: copy the inventory directory, adjust values, reuse playbooks

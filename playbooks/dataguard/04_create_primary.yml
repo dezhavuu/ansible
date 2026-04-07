@@ -1,9 +1,9 @@
 ---
 # =============================================================================
 # Oracle 19c  Create Primary Database + Data Guard Preparation
-# Variables from group_vars/all.yml: oracle_user
-# Variables from inventory: oracle_base, oracle_home, grid_home,
-#   oracle_sid, db_unique_name_pri/stby, pdb_name, sys_password, system_password
+# Variables from inventory: oracle_user, oracle_base, oracle_home, grid_home,
+#   oracle_sid, db_unique_name_pri/stby, pdb_name
+# Variables from vault: sys_password, system_password
 # =============================================================================
 
 # =========================================================================
@@ -378,4 +378,3 @@
           - "{{ logfile_status.stdout_lines }}"
           - "=== Data Guard Parameters ==="
           - "{{ dg_params.stdout_lines }}"
-

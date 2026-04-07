@@ -4,7 +4,8 @@
 # Works for: Data Guard only
 # Ensures MRP is running and Apply Lag is 0 before switchover
 # Variables from inventory: oracle_user, oracle_home, oracle_sid,
-#   db_unique_name_pri, db_unique_name_stby, sys_password
+#   db_unique_name_pri, db_unique_name_stby
+# Variables from vault: sys_password
 # =============================================================================
 - name: "STEP 3: Switchover — Standby becomes Primary"
   hosts: primary
@@ -52,7 +53,9 @@
         EODG
       become_user: "{{ oracle_user }}"
       register: stby_lag
-      until: "'Apply Lag:      0 seconds' in stby_lag.stdout and 'SUCCESS' in stby_lag.stdout"
+      until: >
+        (stby_lag.stdout | regex_search('Apply Lag:\s+0 seconds')) and
+        ('SUCCESS' in stby_lag.stdout)
       retries: 60
       delay: 10
       changed_when: false
@@ -74,7 +77,7 @@
 
     - name: "PRE-CHECK | Abort if standby not ready for switchover"
       fail:
-        msg: "Standby switchover_status is '{{ stby_switchover_status.stdout | trim }}' — expected 'TO PRIMARY' or 'NOT ALLOWED'. MRP may not be running. Fix manually."
+        msg: "Standby switchover_status is '{{ stby_switchover_status.stdout | trim }}' — expected 'TO PRIMARY' or 'NOT ALLOWED'."
       when: "'TO PRIMARY' not in stby_switchover_status.stdout and 'NOT ALLOWED' not in stby_switchover_status.stdout"
 
     # =========================================================================
@@ -106,7 +109,9 @@
         EODG
       become_user: "{{ oracle_user }}"
       register: switchover_check
-      until: "'SUCCESS' in switchover_check.stdout and db_unique_name_stby + ' - Primary' in switchover_check.stdout"
+      until: >
+        'SUCCESS' in switchover_check.stdout and
+        db_unique_name_stby + ' - Primary' in switchover_check.stdout
       retries: 30
       delay: 10
       changed_when: false
@@ -140,7 +145,9 @@
             EODG
           become_user: "{{ oracle_user }}"
           register: retry_check
-          until: "'SUCCESS' in retry_check.stdout and db_unique_name_stby + ' - Primary' in retry_check.stdout"
+          until: >
+            ('SUCCESS' in retry_check.stdout) and
+            (db_unique_name_stby + ' - Primary' in retry_check.stdout)
           retries: 30
           delay: 10
           changed_when: false

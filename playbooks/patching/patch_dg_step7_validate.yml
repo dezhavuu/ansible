@@ -3,7 +3,8 @@
 # STEP 7: Final validation + cleanup
 # Works for: Data Guard AND Standalone
 # Variables from inventory: oracle_user, oracle_home, oracle_sid,
-#   db_unique_name_pri, db_unique_name_stby, sys_password, patch_stage
+#   db_unique_name_pri, db_unique_name_stby
+# Variables from vault: sys_password, patch_stage
 # =============================================================================
 
 # =========================================================================

@@ -1,9 +1,8 @@
 ---
 # =============================================================================
 # Oracle 19c — Data Guard Broker Configuration
-# Variables from group_vars/all.yml: oracle_user
-# Variables from inventory: oracle_home, oracle_sid,
-#   db_unique_name_pri/stby, sys_password
+# Variables from inventory: oracle_user, oracle_home, oracle_sid, db_unique_name_pri/stby
+# Variables from vault: sys_password
 # =============================================================================
 
 # =========================================================================
@@ -187,4 +186,3 @@
           - "{{ show_primary.stdout_lines }}"
           - "=== Standby Database ==="
           - "{{ show_standby.stdout_lines }}"
-

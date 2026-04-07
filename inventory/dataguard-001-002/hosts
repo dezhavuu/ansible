@@ -28,8 +28,6 @@ oracle_sid=CDBTEST
 db_unique_name_pri=CDBTEST_001
 db_unique_name_stby=CDBTEST_002
 pdb_name=PDBTEST
-sys_password={{ vault_sys_password }}
-system_password={{ vault_system_password }}
 
 # Patching
 patch_target_version=19.27

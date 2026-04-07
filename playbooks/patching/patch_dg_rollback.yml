@@ -1,26 +1,64 @@
 ---
 # =============================================================================
 # Oracle 19c — Data Guard Zero Downtime Patch ROLLBACK
-# Order: Rollback Standby → Switchover → Rollback old Primary → Switchback
-# DB is ALWAYS online — no downtime!
-# Works for: Data Guard AND Standalone
+# Reihenfolge: Standby rollback → Switchover → Primary rollback → Switchback
+#              → Datapatch rollback → Cleanup + Validierung
+# DB ist IMMER online — kein Downtime!
+# Funktioniert auch für Standalone (Switchover-Steps werden übersprungen)
 #
-# IMPORTANT: Patches must still be staged in patch_stage!
-#   If already cleaned up, run patch_dg_step1_prepare.yml first
-#   (only OPatch is needed, not the patches themselves — opatch rollback
-#   uses the inventory, not the patch files)
+# Rollback-Reihenfolge pro Server: OJVM → DB → GI (umgekehrt wie Apply)
+# opatch rollback:     braucht KEINE Patch-Dateien (nutzt OPatch Inventory)
+# opatchauto rollback: braucht das GI Patch-Verzeichnis (wird in Play 1 gestaged)
 #
-# For GI rollback, the original GI patch must be available in patch_stage
-#   because opatchauto rollback needs the patch directory
+# Dynamische Rollenerkennung: Playbook erkennt selbst welcher Host Primary/
+# Standby ist — unabhängig vom Inventory. Funktioniert auch nach manuellem
+# Switchover.
 #
-# Variables from inventory: oracle_user, oracle_home, grid_home, oracle_sid,
-#   db_unique_name_pri, db_unique_name_stby, sys_password,
-#   patch_dir, patch_stage, gi_patch_zip, gi_patch_number,
-#   db_patch_number, ojvm_patch_number
+# Variables from inventory: oracle_home, grid_home, oracle_base, oracle_sid,
+#   oracle_user, db_unique_name_pri/stby, patch_stage, patch_dir,
+#   gi_patch_number, gi_patch_zip, db_patch_number, ojvm_patch_number
+# Variables from vault: sys_password
 # =============================================================================
 
 # =========================================================================
-# PLAY 1: STAGE GI PATCH (needed for opatchauto rollback)
+# PLAY 0: DETECT CURRENT DG ROLES DYNAMICALLY
+# =========================================================================
+- name: "ROLLBACK STEP 0: Detect current Primary and Standby"
+  hosts: oracle_servers
+  become: yes
+
+  tasks:
+    - name: "DETECT | Get current database role"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT database_role FROM v\$database;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: db_role
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "DETECT | Add to dyn_primary group"
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: dyn_primary
+      when: "'PRIMARY' in db_role.stdout | default('')"
+
+    - name: "DETECT | Add to dyn_standby group"
+      add_host:
+        name: "{{ inventory_hostname }}"
+        groups: dyn_standby
+      when: "'PHYSICAL STANDBY' in db_role.stdout | default('')"
+
+    - name: "DETECT | Show detected roles"
+      debug:
+        msg: "{{ inventory_hostname }}: {{ db_role.stdout | trim | default('UNKNOWN / DB not running') }}"
+
+# =========================================================================
+# PLAY 1: STAGE GI PATCH (für opatchauto rollback benötigt)
 # =========================================================================
 - name: "ROLLBACK STEP 1: Stage GI patch for opatchauto rollback"
   hosts: oracle_servers
@@ -40,16 +78,19 @@
         path: "{{ patch_stage }}/{{ gi_patch_number }}"
       register: gi_staged
 
-    - name: "STAGE | Copy GI RU patch (needed for opatchauto rollback)"
+    - name: "STAGE | Copy GI RU patch"
       copy:
         src: "{{ patch_dir }}/{{ gi_patch_zip }}"
-        dest: "{{ patch_stage }}/"
+        dest: "{{ patch_stage }}/{{ gi_patch_zip }}"
         owner: "{{ oracle_user }}"
         group: oinstall
+        mode: '0644'
       when: not gi_staged.stat.exists
 
     - name: "STAGE | Unzip GI RU patch"
-      shell: "cd {{ patch_stage }} && unzip -oq {{ gi_patch_zip }}"
+      shell: |
+        cd {{ patch_stage }}
+        unzip -oq {{ gi_patch_zip }}
       become_user: "{{ oracle_user }}"
       when: not gi_staged.stat.exists
 
@@ -57,18 +98,20 @@
       file:
         path: "{{ patch_stage }}/{{ gi_patch_zip }}"
         state: absent
+      when: not gi_staged.stat.exists
 
 # =========================================================================
-# PLAY 2: ROLLBACK STANDBY (PRIMARY STAYS ONLINE)
+# PLAY 2: ROLLBACK STANDBY — Primary bleibt online
 # =========================================================================
 - name: "ROLLBACK STEP 2: Rollback Standby — Primary stays online"
-  hosts: standby
+  hosts: dyn_standby
   become: yes
 
   tasks:
-    # --- Check if patches are applied ---
-    - name: "STBY-CHECK | Check current patch level"
-      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+    - name: "STBY-CHECK | Check current DB patch level"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/OPatch/opatch lspatches 2>/dev/null
       become_user: "{{ oracle_user }}"
       register: current_patches
       changed_when: false
@@ -77,196 +120,218 @@
       debug:
         msg: "{{ current_patches.stdout_lines }}"
 
-    - name: "STBY-CHECK | Skip rollback if patches not applied"
-      set_fact:
-        needs_rollback: "{{ db_patch_number in current_patches.stdout }}"
+    - name: "STBY-CHECK | Skip if no patches to rollback"
+      meta: end_host
+      when:
+        - db_patch_number | string not in current_patches.stdout
+        - ojvm_patch_number | string not in current_patches.stdout
 
-    # --- STOP MRP + DB ---
-    - name: "STBY | Stop Managed Recovery via DG Broker"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-OFF';
-        EXIT;
-        EODG
-      become_user: "{{ oracle_user }}"
-      ignore_errors: yes
-      when: needs_rollback
-
-    - name: "STBY | Shutdown Standby Database"
+    # -------------------------------------------------------------------------
+    # MRP stoppen + DB herunterfahren
+    # -------------------------------------------------------------------------
+    - name: "STBY-PREP | Cancel MRP + Shutdown DB"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         export ORACLE_SID={{ oracle_sid }}
         {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
         SHUTDOWN IMMEDIATE;
         EOSQL
       become_user: "{{ oracle_user }}"
       ignore_errors: yes
-      when: needs_rollback
 
-    - name: "STBY | Wait 10 seconds for processes to terminate"
-      pause:
-        seconds: 10
-      when: needs_rollback
-
-    - name: "STBY | Kill remaining Oracle user processes"
-      shell: "pkill -9 -u {{ oracle_user }} || true"
-      when: needs_rollback
-
-    # --- ROLLBACK OJVM ---
-    - name: "STBY-OJVM | Rollback OJVM RU"
+    # -------------------------------------------------------------------------
+    # OJVM Rollback
+    # -------------------------------------------------------------------------
+    - name: "STBY-OJVM | Rollback OJVM patch"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/OPatch/opatch rollback -id {{ ojvm_patch_number }} -silent \
-          2>&1 | tee /tmp/ojvm_rollback.log
+        {{ oracle_home }}/OPatch/opatch rollback \
+          -id {{ ojvm_patch_number }} -silent \
+          2>&1 | tee /tmp/ojvm_rollback_stby.log
       become_user: "{{ oracle_user }}"
-      register: ojvm_rollback
-      when: needs_rollback
-      ignore_errors: yes
+      register: ojvm_rollback_stby
+      when: ojvm_patch_number | string in current_patches.stdout
 
-    - name: "STBY-OJVM | Show OJVM rollback result (last 10 lines)"
+    - name: "STBY-OJVM | Show result"
       debug:
-        msg: "{{ ojvm_rollback.stdout_lines[-10:] }}"
-      when: ojvm_rollback.stdout_lines is defined
+        msg: "{{ ojvm_rollback_stby.stdout_lines[-10:] }}"
+      when: ojvm_rollback_stby.stdout_lines is defined
 
-    # --- ROLLBACK DB RU ---
-    - name: "STBY-DB | Rollback DB RU"
+    # -------------------------------------------------------------------------
+    # DB Rollback
+    # -------------------------------------------------------------------------
+    - name: "STBY-DB | Rollback DB RU patch"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/OPatch/opatch rollback -id {{ db_patch_number }} -silent \
-          2>&1 | tee /tmp/db_rollback.log
+        {{ oracle_home }}/OPatch/opatch rollback \
+          -id {{ db_patch_number }} -silent \
+          2>&1 | tee /tmp/db_rollback_stby.log
       become_user: "{{ oracle_user }}"
-      register: db_rollback
-      when: needs_rollback
+      register: db_rollback_stby
+      when: db_patch_number | string in current_patches.stdout
 
-    - name: "STBY-DB | Show DB rollback result (last 10 lines)"
+    - name: "STBY-DB | Show result"
       debug:
-        msg: "{{ db_rollback.stdout_lines[-10:] }}"
-      when: db_rollback.stdout_lines is defined
+        msg: "{{ db_rollback_stby.stdout_lines[-10:] }}"
+      when: db_rollback_stby.stdout_lines is defined
 
-    # --- ROLLBACK GI ---
-    - name: "STBY-GI | Rollback GI RU via opatchauto (takes ~15-30 min)"
-      shell: |
-        export PATH={{ grid_home }}/OPatch:$PATH
-        {{ grid_home }}/OPatch/opatchauto rollback {{ patch_stage }}/{{ gi_patch_number }} \
-          -oh {{ grid_home }} \
-          2>&1 | tee /tmp/gi_rollback.log
-      register: gi_rollback
-      when: needs_rollback
-
-    - name: "STBY-GI | Show GI rollback result (last 20 lines)"
-      debug:
-        msg: "{{ gi_rollback.stdout_lines[-20:] }}"
-      when: gi_rollback.stdout_lines is defined
-
-    # --- START STANDBY + MRP ---
-    - name: "STBY | Start Standby Database (MOUNT)"
+    # -------------------------------------------------------------------------
+    # GI Rollback
+    # -------------------------------------------------------------------------
+    - name: "STBY-GI | Check current GI patch level"
       shell: |
         export ORACLE_HOME={{ grid_home }}
-        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_stby }} -o mount
+        {{ grid_home }}/OPatch/opatch lspatches 2>/dev/null
       become_user: "{{ oracle_user }}"
-      when: needs_rollback
-
-    - name: "STBY | Enable Managed Recovery via DG Broker"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-ON';
-        EXIT;
-        EODG
-      become_user: "{{ oracle_user }}"
-      when: needs_rollback
-
-    - name: "STBY | Wait for redo apply to catch up (max 5 min)"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
-        SHOW DATABASE '{{ db_unique_name_stby }}';
-        EXIT;
-        EODG
-      become_user: "{{ oracle_user }}"
-      register: stby_status
-      until: "'apply lag' in stby_status.stdout | lower and 'SUCCESS' in stby_status.stdout"
-      retries: 30
-      delay: 10
-      changed_when: false
-      when: needs_rollback
-
-    - name: "STBY | Verify patch level after rollback"
-      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
-      become_user: "{{ oracle_user }}"
-      register: stby_patches
+      register: gi_patches_stby
       changed_when: false
 
-    - name: "STBY | Show patches"
+    - name: "STBY-GI | Kill oracle processes before opatchauto"
+      shell: pkill -9 -u oracle || true
+
+    - name: "STBY-GI | Rollback GI RU via opatchauto"
+      shell: |
+        {{ grid_home }}/OPatch/opatchauto rollback \
+          -oh {{ grid_home }} \
+          -patch_path {{ patch_stage }}/{{ gi_patch_number }} \
+          2>&1 | tee /tmp/gi_rollback_stby.log
+      register: gi_rollback_stby
+      when: gi_patch_number | string in gi_patches_stby.stdout
+
+    - name: "STBY-GI | Show result (last 15 lines)"
       debug:
-        msg: "{{ stby_patches.stdout_lines }}"
+        msg: "{{ gi_rollback_stby.stdout_lines[-15:] }}"
+      when: gi_rollback_stby.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # Standby neu starten + MRP — robust gegen alle Startzustände
+    # -------------------------------------------------------------------------
+    - name: "STBY-POST | Get instance status"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT status FROM v\$instance;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: inst_stat_stby
+      changed_when: false
+      ignore_errors: yes
+
+    - name: "STBY-POST | Startup MOUNT (DB is shutdown)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        STARTUP MOUNT;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      when: inst_stat_stby.rc != 0 or inst_stat_stby.stdout | trim == ''
+
+    - name: "STBY-POST | ALTER DATABASE MOUNT (DB is in NOMOUNT)"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE MOUNT;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      when:
+        - inst_stat_stby.rc == 0
+        - "'STARTED' in inst_stat_stby.stdout"
+
+    - name: "STBY-POST | Start MRP"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+
+    - name: "STBY-POST | Verify MRP running"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT process||' '||status FROM v\$managed_standby WHERE process='MRP0';
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: mrp_check
+      changed_when: false
+
+    - name: "STBY-POST | Show MRP status"
+      debug:
+        msg: "{{ mrp_check.stdout | trim }}"
+
+    - name: "STBY-POST | Fail if MRP not running"
+      fail:
+        msg: "MRP0 läuft nicht auf {{ inventory_hostname }} — Switchover nicht sicher"
+      when: "'APPLYING_LOG' not in mrp_check.stdout"
 
 # =========================================================================
-# PLAY 3: SWITCHOVER (DATA GUARD ONLY)
+# PLAY 3: SWITCHOVER → aktueller Standby wird Primary
 # =========================================================================
-- name: "ROLLBACK STEP 3: Switchover — Standby becomes Primary"
-  hosts: primary
+- name: "ROLLBACK STEP 3: Switchover to standby"
+  hosts: dyn_primary
   become: yes
 
   tasks:
-    - name: "SWITCHOVER | Check if Data Guard exists"
-      set_fact:
-        has_standby: "{{ groups['standby'] is defined and groups['standby'] | length > 0 }}"
-
-    - name: "SWITCHOVER | Verify DG config is SUCCESS"
+    - name: "SWITCH | Check DG Broker status"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        {{ oracle_home }}/bin/dgmgrl / <<EODG
         SHOW CONFIGURATION;
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      register: pre_switchover
+      register: dg_config
       changed_when: false
-      when: has_standby
+      ignore_errors: yes
 
-    - name: "SWITCHOVER | Abort if configuration is not SUCCESS"
-      fail:
-        msg: "DG Configuration is not SUCCESS — switchover not safe."
-      when: "has_standby and 'SUCCESS' not in pre_switchover.stdout"
+    - name: "SWITCH | Skip — no Data Guard"
+      meta: end_host
+      when: "'SUCCESS' not in dg_config.stdout | default('')"
 
-    - name: "SWITCHOVER | Ensure MRP is running (APPLY-ON)"
+    - name: "SWITCH | Wait for apply lag = 0 (max 10 min)"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_stby }}' SET STATE='APPLY-ON';
-        EXIT;
-        EODG
+        export ORACLE_SID={{ oracle_sid }}
+        for i in $(seq 1 20); do
+          LAG=$({{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT value FROM v\$dataguard_stats WHERE name='apply lag';
+        EOSQL
+        )
+          echo "Apply lag: $LAG"
+          if echo "$LAG" | grep -qE "\+00 00:00:0[0-9]"; then
+            echo "LAG_OK"
+            break
+          fi
+          sleep 30
+        done
       become_user: "{{ oracle_user }}"
-      when: has_standby
+      register: lag_check
+      failed_when: "'LAG_OK' not in lag_check.stdout"
 
-    - name: "SWITCHOVER | Wait for Apply Lag = 0 (max 10 min)"
+    - name: "SWITCH | Perform switchover"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
-        SHOW DATABASE '{{ db_unique_name_stby }}';
-        EXIT;
-        EODG
-      become_user: "{{ oracle_user }}"
-      register: stby_lag
-      until: "'Apply Lag:      0 seconds' in stby_lag.stdout and 'SUCCESS' in stby_lag.stdout"
-      retries: 60
-      delay: 10
-      changed_when: false
-      when: has_standby
-
-    - name: "SWITCHOVER | Execute switchover"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
+        {{ oracle_home }}/bin/dgmgrl / <<EODG
         SWITCHOVER TO '{{ db_unique_name_stby }}';
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      when: has_standby
+      register: switchover_result
 
-    - name: "SWITCHOVER | Wait for switchover to complete (max 5 min)"
+    - name: "SWITCH | Show switchover result"
+      debug:
+        msg: "{{ switchover_result.stdout_lines }}"
+
+    - name: "SWITCH | Verify config after switchover"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
@@ -274,207 +339,241 @@
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      register: switchover_check
-      until: "'SUCCESS' in switchover_check.stdout and db_unique_name_stby + ' - Primary' in switchover_check.stdout"
-      retries: 30
-      delay: 10
+      register: config_after_switch
       changed_when: false
-      when: has_standby
+
+    - name: "SWITCH | Fail if config not SUCCESS"
+      fail:
+        msg: "Switchover fehlgeschlagen — DG Config nicht SUCCESS"
+      when: "'SUCCESS' not in config_after_switch.stdout | default('')"
 
 # =========================================================================
-# PLAY 4: ROLLBACK PRIMARY (NOW STANDBY)
+# PLAY 4: ROLLBACK OLD PRIMARY (jetzt Standby)
 # =========================================================================
-- name: "ROLLBACK STEP 4: Rollback Primary — new Primary stays online"
-  hosts: primary
+- name: "ROLLBACK STEP 4: Rollback old primary"
+  hosts: dyn_primary
   become: yes
 
   tasks:
-    - name: "PRI-CHECK | Check current patch level"
-      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
-      become_user: "{{ oracle_user }}"
-      register: current_patches
-      changed_when: false
-
-    - name: "PRI-CHECK | Skip rollback if patches not applied"
-      set_fact:
-        needs_rollback: "{{ db_patch_number in current_patches.stdout }}"
-        has_standby: "{{ groups['standby'] is defined and groups['standby'] | length > 0 }}"
-
-    # --- STOP MRP + DB ---
-    - name: "PRI | Stop Managed Recovery via DG Broker"
+    - name: "PRI-CHECK | Check current DB patch level"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-OFF';
-        EXIT;
-        EODG
+        {{ oracle_home }}/OPatch/opatch lspatches 2>/dev/null
       become_user: "{{ oracle_user }}"
-      ignore_errors: yes
-      when: needs_rollback and has_standby
+      register: current_patches_pri
+      changed_when: false
 
-    - name: "PRI | Shutdown Database"
+    - name: "PRI-CHECK | Show current patches"
+      debug:
+        msg: "{{ current_patches_pri.stdout_lines }}"
+
+    - name: "PRI-CHECK | Skip if no patches to rollback"
+      meta: end_host
+      when:
+        - db_patch_number | string not in current_patches_pri.stdout
+        - ojvm_patch_number | string not in current_patches_pri.stdout
+
+    - name: "PRI-PREP | Cancel MRP + Shutdown DB"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         export ORACLE_SID={{ oracle_sid }}
         {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
         SHUTDOWN IMMEDIATE;
         EOSQL
       become_user: "{{ oracle_user }}"
       ignore_errors: yes
-      when: needs_rollback
 
-    - name: "PRI | Wait 10 seconds for processes to terminate"
-      pause:
-        seconds: 10
-      when: needs_rollback
-
-    - name: "PRI | Kill remaining Oracle user processes"
-      shell: "pkill -9 -u {{ oracle_user }} || true"
-      when: needs_rollback
-
-    # --- ROLLBACK OJVM ---
-    - name: "PRI-OJVM | Rollback OJVM RU"
+    # -------------------------------------------------------------------------
+    # OJVM Rollback
+    # -------------------------------------------------------------------------
+    - name: "PRI-OJVM | Rollback OJVM patch"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/OPatch/opatch rollback -id {{ ojvm_patch_number }} -silent \
-          2>&1 | tee /tmp/ojvm_rollback.log
+        {{ oracle_home }}/OPatch/opatch rollback \
+          -id {{ ojvm_patch_number }} -silent \
+          2>&1 | tee /tmp/ojvm_rollback_pri.log
       become_user: "{{ oracle_user }}"
-      when: needs_rollback
+      register: ojvm_rollback_pri
+      when: ojvm_patch_number | string in current_patches_pri.stdout
+
+    - name: "PRI-OJVM | Show result"
+      debug:
+        msg: "{{ ojvm_rollback_pri.stdout_lines[-10:] }}"
+      when: ojvm_rollback_pri.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # DB Rollback
+    # -------------------------------------------------------------------------
+    - name: "PRI-DB | Rollback DB RU patch"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/OPatch/opatch rollback \
+          -id {{ db_patch_number }} -silent \
+          2>&1 | tee /tmp/db_rollback_pri.log
+      become_user: "{{ oracle_user }}"
+      register: db_rollback_pri
+      when: db_patch_number | string in current_patches_pri.stdout
+
+    - name: "PRI-DB | Show result"
+      debug:
+        msg: "{{ db_rollback_pri.stdout_lines[-10:] }}"
+      when: db_rollback_pri.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # GI Rollback
+    # -------------------------------------------------------------------------
+    - name: "PRI-GI | Check current GI patch level"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/OPatch/opatch lspatches 2>/dev/null
+      become_user: "{{ oracle_user }}"
+      register: gi_patches_pri
+      changed_when: false
+
+    - name: "PRI-GI | Kill oracle processes before opatchauto"
+      shell: pkill -9 -u oracle || true
+
+    - name: "PRI-GI | Rollback GI RU via opatchauto"
+      shell: |
+        {{ grid_home }}/OPatch/opatchauto rollback \
+          -oh {{ grid_home }} \
+          -patch_path {{ patch_stage }}/{{ gi_patch_number }} \
+          2>&1 | tee /tmp/gi_rollback_pri.log
+      register: gi_rollback_pri
+      when: gi_patch_number | string in gi_patches_pri.stdout
+
+    - name: "PRI-GI | Show result (last 15 lines)"
+      debug:
+        msg: "{{ gi_rollback_pri.stdout_lines[-15:] }}"
+      when: gi_rollback_pri.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # Als Standby starten + MRP — robust gegen alle Startzustände
+    # -------------------------------------------------------------------------
+    - name: "PRI-POST | Get instance status"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT status FROM v\$instance;
+        EOSQL
+      become_user: "{{ oracle_user }}"
+      register: inst_stat_pri
+      changed_when: false
       ignore_errors: yes
 
-    # --- ROLLBACK DB RU ---
-    - name: "PRI-DB | Rollback DB RU"
+    - name: "PRI-POST | Startup MOUNT (DB is shutdown)"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/OPatch/opatch rollback -id {{ db_patch_number }} -silent \
-          2>&1 | tee /tmp/db_rollback.log
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        STARTUP MOUNT;
+        EOSQL
       become_user: "{{ oracle_user }}"
-      when: needs_rollback
+      when: inst_stat_pri.rc != 0 or inst_stat_pri.stdout | trim == ''
 
-    # --- ROLLBACK GI ---
-    - name: "PRI-GI | Rollback GI RU via opatchauto (takes ~15-30 min)"
-      shell: |
-        export PATH={{ grid_home }}/OPatch:$PATH
-        {{ grid_home }}/OPatch/opatchauto rollback {{ patch_stage }}/{{ gi_patch_number }} \
-          -oh {{ grid_home }} \
-          2>&1 | tee /tmp/gi_rollback.log
-      when: needs_rollback
-
-    # --- START DB ---
-    - name: "PRI | Start Database (MOUNT — Data Guard standby)"
-      shell: |
-        export ORACLE_HOME={{ grid_home }}
-        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_pri }} -o mount
-      become_user: "{{ oracle_user }}"
-      when: needs_rollback and has_standby
-
-    - name: "PRI | Enable Managed Recovery"
+    - name: "PRI-POST | ALTER DATABASE MOUNT (DB is in NOMOUNT)"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-ON';
-        EXIT;
-        EODG
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE MOUNT;
+        EOSQL
       become_user: "{{ oracle_user }}"
-      when: needs_rollback and has_standby
+      when:
+        - inst_stat_pri.rc == 0
+        - "'STARTED' in inst_stat_pri.stdout"
 
-    - name: "PRI | Wait for redo apply to catch up (max 5 min)"
+    - name: "PRI-POST | Start MRP"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
-        SHOW DATABASE '{{ db_unique_name_pri }}';
-        EXIT;
-        EODG
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+        EOSQL
       become_user: "{{ oracle_user }}"
-      register: pri_status
-      until: "'apply lag' in pri_status.stdout | lower and 'SUCCESS' in pri_status.stdout"
-      retries: 30
-      delay: 10
-      changed_when: false
-      when: needs_rollback and has_standby
 
-    - name: "PRI | Start Database (OPEN — Standalone)"
+    - name: "PRI-POST | Verify MRP running"
       shell: |
-        export ORACLE_HOME={{ grid_home }}
-        {{ grid_home }}/bin/srvctl start database -d {{ db_unique_name_pri }}
+        export ORACLE_HOME={{ oracle_home }}
+        export ORACLE_SID={{ oracle_sid }}
+        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT process||' '||status FROM v\$managed_standby WHERE process='MRP0';
+        EOSQL
       become_user: "{{ oracle_user }}"
-      when: needs_rollback and not has_standby
-
-    - name: "PRI | Verify patch level after rollback"
-      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
-      become_user: "{{ oracle_user }}"
-      register: pri_patches
+      register: mrp_check_pri
       changed_when: false
 
-    - name: "PRI | Show patches"
+    - name: "PRI-POST | Show MRP status"
       debug:
-        msg: "{{ pri_patches.stdout_lines }}"
+        msg: "{{ mrp_check_pri.stdout | trim }}"
+
+    - name: "PRI-POST | Fail if MRP not running"
+      fail:
+        msg: "MRP0 läuft nicht auf {{ inventory_hostname }} — Switchback nicht sicher"
+      when: "'APPLYING_LOG' not in mrp_check_pri.stdout"
 
 # =========================================================================
-# PLAY 5: SWITCHBACK (DATA GUARD ONLY)
+# PLAY 5: SWITCHBACK → Original-Rollen
 # =========================================================================
-- name: "ROLLBACK STEP 5: Switchover back — restore original roles"
-  hosts: standby
+- name: "ROLLBACK STEP 5: Switchback to original roles"
+  hosts: dyn_standby
   become: yes
 
   tasks:
-    - name: "SWITCHBACK | Check if Data Guard exists"
-      set_fact:
-        has_standby: "{{ groups['standby'] is defined and groups['standby'] | length > 0 }}"
-
-    - name: "SWITCHBACK | Verify DG config is SUCCESS"
+    - name: "SWITCHBACK | Check DG config"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        {{ oracle_home }}/bin/dgmgrl / <<EODG
         SHOW CONFIGURATION;
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      register: pre_switchback
+      register: dg_config_back
       changed_when: false
-      when: has_standby
+      ignore_errors: yes
 
-    - name: "SWITCHBACK | Abort if configuration is not SUCCESS"
-      fail:
-        msg: "DG Configuration is not SUCCESS — switchback not safe."
-      when: "has_standby and 'SUCCESS' not in pre_switchback.stdout"
+    - name: "SWITCHBACK | Skip — no Data Guard"
+      meta: end_host
+      when: "'SUCCESS' not in dg_config_back.stdout | default('')"
 
-    - name: "SWITCHBACK | Ensure MRP is running (APPLY-ON)"
+    - name: "SWITCHBACK | Wait for apply lag = 0 (max 10 min)"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
-        EDIT DATABASE '{{ db_unique_name_pri }}' SET STATE='APPLY-ON';
+        for i in $(seq 1 20); do
+          LAG=$({{ oracle_home }}/bin/dgmgrl / <<EODG
+        SHOW DATABASE VERBOSE '{{ db_unique_name_pri }}';
         EXIT;
         EODG
+        )
+          if echo "$LAG" | grep -qE "Apply Lag.*\+00 00:00:0[0-9]"; then
+            echo "LAG_OK"
+            break
+          fi
+          sleep 30
+        done
       become_user: "{{ oracle_user }}"
-      when: has_standby
+      register: lag_check_back
+      failed_when: "'LAG_OK' not in lag_check_back.stdout"
 
-    - name: "SWITCHBACK | Wait for Apply Lag = 0 (max 10 min)"
+    - name: "SWITCHBACK | Switchback to original primary"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
-        SHOW DATABASE '{{ db_unique_name_pri }}';
-        EXIT;
-        EODG
-      become_user: "{{ oracle_user }}"
-      register: pri_lag
-      until: "'Apply Lag:      0 seconds' in pri_lag.stdout and 'SUCCESS' in pri_lag.stdout"
-      retries: 60
-      delay: 10
-      changed_when: false
-      when: has_standby
-
-    - name: "SWITCHBACK | Execute switchover back"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_stby }} <<EODG
+        {{ oracle_home }}/bin/dgmgrl / <<EODG
         SWITCHOVER TO '{{ db_unique_name_pri }}';
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      when: has_standby
+      register: switchback_result
 
-    - name: "SWITCHBACK | Wait for switchback to complete (max 5 min)"
+    - name: "SWITCHBACK | Show result"
+      debug:
+        msg: "{{ switchback_result.stdout_lines }}"
+
+    - name: "SWITCHBACK | Verify final configuration"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         {{ oracle_home }}/bin/dgmgrl sys/{{ sys_password }}@{{ db_unique_name_pri }} <<EODG
@@ -482,31 +581,23 @@
         EXIT;
         EODG
       become_user: "{{ oracle_user }}"
-      register: switchback_check
-      until: "'SUCCESS' in switchback_check.stdout and db_unique_name_pri + ' - Primary' in switchback_check.stdout"
-      retries: 30
-      delay: 10
+      register: final_config
       changed_when: false
-      when: has_standby
+
+    - name: "SWITCHBACK | Fail if config not SUCCESS"
+      fail:
+        msg: "Switchback fehlgeschlagen — DG Config nicht SUCCESS"
+      when: "'SUCCESS' not in final_config.stdout | default('')"
 
 # =========================================================================
-# PLAY 6: DATAPATCH ROLLBACK ON PRIMARY
+# PLAY 6: DATAPATCH ROLLBACK
 # =========================================================================
-- name: "ROLLBACK STEP 6: Datapatch rollback on Primary"
-  hosts: primary
+- name: "ROLLBACK STEP 6: Datapatch rollback"
+  hosts: dyn_primary
   become: yes
 
   tasks:
-    - name: "DATAPATCH | Ensure PDBs are open"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        export ORACLE_SID={{ oracle_sid }}
-        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
-        ALTER PLUGGABLE DATABASE ALL OPEN;
-        EOSQL
-      become_user: "{{ oracle_user }}"
-
-    - name: "DATAPATCH | Run datapatch to rollback SQL changes"
+    - name: "DATAPATCH | Run datapatch (auto-detects rollback)"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         export ORACLE_SID={{ oracle_sid }}
@@ -515,68 +606,57 @@
       become_user: "{{ oracle_user }}"
       register: datapatch_result
 
-    - name: "DATAPATCH | Show datapatch result (last 20 lines)"
+    - name: "DATAPATCH | Show result (last 20 lines)"
       debug:
         msg: "{{ datapatch_result.stdout_lines[-20:] }}"
 
-    - name: "DATAPATCH | Verify datapatch status"
-      shell: |
-        export ORACLE_HOME={{ oracle_home }}
-        export ORACLE_SID={{ oracle_sid }}
-        {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
-        COL patch_id FORMAT 99999999
-        COL action FORMAT A10
-        COL status FORMAT A10
-        COL description FORMAT A60
-        SELECT patch_id, action, status, description
-        FROM dba_registry_sqlpatch
-        ORDER BY action_time;
-        EOSQL
-      become_user: "{{ oracle_user }}"
-      register: sqlpatch
-      changed_when: false
-
-    - name: "DATAPATCH | Show sqlpatch status"
-      debug:
-        msg: "{{ sqlpatch.stdout_lines }}"
-
 # =========================================================================
-# PLAY 7: CLEANUP
+# PLAY 7: CLEANUP + VALIDIERUNG
 # =========================================================================
-- name: "ROLLBACK STEP 7: Cleanup"
+- name: "ROLLBACK STEP 7: Cleanup and validate"
   hosts: oracle_servers
   become: yes
 
   tasks:
-    - name: "CLEANUP | Remove patch staging directory"
+    - name: "CLEANUP | Remove staged patches"
       file:
         path: "{{ patch_stage }}"
         state: absent
 
-    - name: "CLEANUP | Remove rollback log files"
-      shell: "rm -f /tmp/gi_rollback.log /tmp/db_rollback.log /tmp/ojvm_rollback.log /tmp/datapatch_rollback.log"
-
-    - name: "VALIDATE | Check final versions"
+    - name: "VALIDATE | DB version"
       shell: |
         export ORACLE_HOME={{ oracle_home }}
         export ORACLE_SID={{ oracle_sid }}
         {{ oracle_home }}/bin/sqlplus -s / as sysdba <<EOSQL
-        SET HEADING OFF FEEDBACK OFF
-        SELECT banner_full FROM v\$version WHERE ROWNUM=1;
+        SET HEADING OFF FEEDBACK OFF PAGES 0
+        SELECT version_full FROM v\$instance;
         EOSQL
       become_user: "{{ oracle_user }}"
       register: db_version
       changed_when: false
 
-    - name: "VALIDATE | Check patches"
-      shell: "{{ oracle_home }}/OPatch/opatch lspatches"
+    - name: "VALIDATE | DB patches"
+      shell: |
+        export ORACLE_HOME={{ oracle_home }}
+        {{ oracle_home }}/OPatch/opatch lspatches
       become_user: "{{ oracle_user }}"
-      register: patches
+      register: db_patches
       changed_when: false
 
-    - name: "VALIDATE | Show final status"
+    - name: "VALIDATE | GI patches"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        {{ grid_home }}/OPatch/opatch lspatches
+      become_user: "{{ oracle_user }}"
+      register: gi_patches
+      changed_when: false
+
+    - name: "VALIDATE | Show results"
       debug:
         msg:
-          - "=== {{ inventory_hostname }} ==="
+          - "=== DB Version ({{ inventory_hostname }}) ==="
           - "{{ db_version.stdout | trim }}"
-          - "{{ patches.stdout_lines }}"
+          - "=== DB Patches ==="
+          - "{{ db_patches.stdout_lines }}"
+          - "=== GI Patches ==="
+          - "{{ gi_patches.stdout_lines }}"

@@ -1,8 +1,9 @@
 ---
 # =============================================================================
 # Oracle 19c  OS Preparation Playbook
-# Variables from group_vars/all.yml: oracle_user, oracle_uid, iso_mount
-# Variables from inventory: oracle_base, oracle_home, grid_home, oracle_inventory
+# Variables from inventory: oracle_user, oracle_uid, iso_mount,
+#   oracle_base, oracle_home, grid_home, oracle_inventory
+# Variables from vault: oracle_password
 # Single oracle user owns both GI and DB
 # =============================================================================
 - name: Oracle 19c OS Preparation
@@ -14,7 +15,6 @@
     # -------------------------------------------------------------------------
     oracle_user: oracle
     oracle_uid: 54321
-    oracle_password: oracle
     oracle_groups:
       - { name: oinstall,  gid: 54321 }
       - { name: dba,       gid: 54322 }
@@ -276,11 +276,9 @@
     - name: "NETWORK | Add host entries"
       lineinfile:
         path: /etc/hosts
-        line: "{{ item }}"
+        line: "{{ hostvars[item]['ansible_host'] }}  {{ item }}"
         state: present
-      loop:
-        - "192.168.178.21  dghost-001"
-        - "192.168.178.22  dghost-002"
+      loop: "{{ groups['oracle_servers'] }}"
 
     # =========================================================================
     # PHASE 10: FIREWALL & SELINUX
@@ -347,4 +345,3 @@
           - "{{ dirs_check.stdout_lines }}"
           - "ASM Disks:"
           - "{{ asm_check.stdout_lines }}"
-

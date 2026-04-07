@@ -1,9 +1,9 @@
 ---
 # =============================================================================
 # Oracle 19c  Create Physical Standby Database via RMAN Duplicate
-# Variables from group_vars/all.yml: oracle_user
-# Variables from inventory: oracle_base, oracle_home, grid_home,
-#   oracle_sid, db_unique_name_pri/stby, sys_password
+# Variables from inventory: oracle_user, oracle_base, oracle_home, grid_home,
+#   oracle_sid, db_unique_name_pri/stby
+# Variables from vault: sys_password
 # =============================================================================
 
 # =========================================================================
@@ -253,4 +253,3 @@
           - "{{ dg_stats.stdout_lines | default('N/A - primary server') }}"
           - "=== MRP Process ==="
           - "{{ mrp_status.stdout_lines | default('N/A - primary server') }}"
-
